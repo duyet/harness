@@ -1,6 +1,6 @@
 id = "harness"
 name = "Harness"
-version = "0.0.4"
+version = "0.0.5"
 description = "Persistent local agent harness. Separate from herdr-desk."
 min_herdr_version = "0.7.0"
 platforms = ["linux", "macos"]
@@ -42,3 +42,18 @@ command = ["bin/harness", "gateway", "status"]
 id = "gateway-stop"
 title = "Stop local gateway"
 command = ["bin/harness", "gateway", "stop"]
+
+[[actions]]
+id = "issues-list"
+title = "List mock Sentry/Bugsink GitHub issue drafts"
+command = ["bin/harness", "issues", "list"]
+
+[[actions]]
+id = "pick"
+title = "Pick next task (issues > config tasks > freeform)"
+command = ["bin/harness", "pick"]
+
+[[actions]]
+id = "summary"
+title = "On-demand daily summary (no cron)"
+command = ["bin/harness", "summary"]

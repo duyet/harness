@@ -23,5 +23,11 @@
     { "id": "docs", "adapter": "claude" },
     { "id": "anyr-via", "adapter": "anyr" },
     { "id": "codex-task", "adapter": "codex" }
+  ],
+  "playbooks": [
+    {
+      "id": "desk:sentry-issues",
+      "description": "Sentry/Bugsink error events → mock GitHub issue drafts (on-demand ingest, no GitHub API, no cron)"
+    }
   ]
 }

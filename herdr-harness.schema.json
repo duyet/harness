@@ -33,6 +33,19 @@
     "tasks": {
       "type": "array",
       "items": { "$ref": "#/$defs/task" }
+    },
+    "playbooks": {
+      "type": "array",
+      "description": "Declared playbook ids. desk:sentry-issues maps Sentry/Bugsink events to mock GitHub issue drafts (no GitHub API, no cron).",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id"],
+        "properties": {
+          "id": { "type": "string" },
+          "description": { "type": "string" }
+        }
+      }
     }
   },
   "$defs": {

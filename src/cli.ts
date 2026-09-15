@@ -18,8 +18,10 @@ import {
   STATE_FILE,
   GATEWAY_PID_FILE,
   GATEWAY_META_FILE,
+  INGRESS_QUEUE_FILE,
   VERSION,
   RESTART_RESUME_HINT,
+  PLAYBOOK_SENTRY,
   loadState,
   saveState,
   loadConfig,
@@ -30,6 +32,7 @@ import {
   type State,
 } from "./shared.ts";
 import { lastIngress } from "./gateway.ts";
+import { ingestErrorEvent, listIssueDrafts } from "./issues.ts";
 
 const BIN_PATH = join(ROOT, "bin", "harness");
 const LINK_PATH = join(homedir(), ".local", "bin", "harness");
@@ -40,6 +43,13 @@ function argvFlags(from = 3): Set<string> {
 
 function positional(from = 3): string[] {
   return process.argv.slice(from).filter((a) => !a.startsWith("-"));
+}
+
+function optValue(name: string, from = 3): string | undefined {
+  const args = process.argv.slice(from);
+  const i = args.indexOf(name);
+  if (i >= 0) return args[i + 1];
+  return undefined;
 }
 
 function resolvedLinkTarget(): string | null {
@@ -464,6 +474,207 @@ function cmdGatewayStop() {
   printJson({ ok: true, stopped: true, pid });
 }
 
+async function readJsonPayload(from: number): Promise<Record<string, unknown>> {
+  const file = optValue("--file", from);
+  const text = file
+    ? readFileSync(file, "utf8")
+    : await Bun.stdin.text();
+  if (!text.trim()) {
+    throw new Error("empty payload; pass --file PATH or JSON on stdin");
+  }
+  return JSON.parse(text) as Record<string, unknown>;
+}
+
+async function cmdIssues() {
+  const sub = process.argv[3];
+  if (sub === "list") {
+    const drafts = listIssueDrafts();
+    printJson({ ok: true, playbook: PLAYBOOK_SENTRY, count: drafts.length, drafts });
+    return;
+  }
+  if (sub === "ingest") {
+    const source = (optValue("--source", 4) || positional(4)[0] || "") as string;
+    if (source !== "sentry" && source !== "bugsink") {
+      printJson({
+        ok: false,
+        error: "need --source sentry|bugsink",
+      });
+      process.exit(1);
+    }
+    try {
+      const raw = await readJsonPayload(4);
+      const draft = ingestErrorEvent(source, raw);
+      printJson({
+        ok: true,
+        github: "not called (mock-draft)",
+        playbook: PLAYBOOK_SENTRY,
+        path: draft.path,
+        draft,
+      });
+    } catch (e) {
+      printJson({ ok: false, error: String(e) });
+      process.exit(1);
+    }
+    return;
+  }
+  printJson({
+    ok: false,
+    error: sub ? `unknown issues subcommand: ${sub}` : "missing issues subcommand",
+    usage: ["harness issues ingest --source sentry|bugsink [--file PATH]", "harness issues list"],
+  });
+  process.exit(1);
+}
+
+function loadIngressQueue(): Array<{ freeform?: boolean; taskId?: string | null; text?: string | null; at?: string; source?: string }> {
+  if (!existsSync(INGRESS_QUEUE_FILE)) return [];
+  try {
+    return JSON.parse(readFileSync(INGRESS_QUEUE_FILE, "utf8"));
+  } catch {
+    return [];
+  }
+}
+
+function cmdPick() {
+  const { config } = loadConfig();
+  const defaultAdapter = config?.adapters?.default ?? config?.agent ?? "grok-build";
+  const drafts = listIssueDrafts().filter((d) => d.status === "mock-draft");
+  const tasks = config?.tasks ?? [];
+  const queue = loadIngressQueue();
+  const prev = loadState();
+
+  let chosen: {
+    id: string;
+    kind: "issue" | "task" | "freeform";
+    adapter: string;
+    reason: string;
+    title?: string;
+  } | null = null;
+
+  if (drafts.length) {
+    const d = drafts[0];
+    chosen = {
+      id: `issue:${d.fingerprint}`,
+      kind: "issue",
+      adapter: defaultAdapter,
+      reason: "priority: mock issues first (desk:sentry-issues)",
+      title: d.title,
+    };
+  } else if (tasks.length) {
+    const lastId = prev.lastPicked?.kind === "task" ? prev.lastPicked.id : null;
+    const idx = lastId ? tasks.findIndex((t) => t.id === lastId) : -1;
+    const next = tasks[(idx + 1) % tasks.length];
+    chosen = {
+      id: next.id,
+      kind: "task",
+      adapter: next.adapter ?? defaultAdapter,
+      reason: "priority: named tasks by list order (rotate after lastPicked)",
+    };
+  } else {
+    const free = [...queue].reverse().find((e) => e.freeform);
+    if (free) {
+      chosen = {
+        id: free.taskId || "freeform",
+        kind: "freeform",
+        adapter: defaultAdapter,
+        reason: "priority: freeform ingress queue",
+        title: free.text ?? undefined,
+      };
+    }
+  }
+
+  if (!chosen) {
+    if (process.argv.includes("--json") || !process.stdout.isTTY) {
+      printJson({ ok: false, error: "nothing to pick" });
+    } else {
+      console.error("nothing to pick");
+    }
+    process.exit(1);
+  }
+
+  const state = loadState();
+  saveState({
+    ...state,
+    lastPicked: { id: chosen.id, kind: chosen.kind, adapter: chosen.adapter, at: new Date().toISOString() },
+  });
+
+  const json = { ok: true, ...chosen, rules: ["mock issues > named tasks by list order > freeform queue"] };
+  if (process.argv.includes("--json") || !process.stdout.isTTY) {
+    printJson(json);
+    return;
+  }
+  console.log(`picked ${chosen.id} via ${chosen.adapter} (${chosen.kind})`);
+  console.log(chosen.reason);
+}
+
+function cmdSummary() {
+  const state = loadState();
+  const { path: configPath, config } = loadConfig();
+  const drafts = listIssueDrafts();
+  const last = lastIngress();
+  const gPid = existsSync(GATEWAY_PID_FILE)
+    ? Number(readFileSync(GATEWAY_PID_FILE, "utf8").trim())
+    : null;
+  const json = {
+    ok: true,
+    version: VERSION,
+    generatedAt: new Date().toISOString(),
+    session: {
+      started: state.started,
+      startedAt: state.startedAt ?? null,
+      sessionId: state.sessionId ?? null,
+      lastPicked: state.lastPicked ?? null,
+    },
+    configPath,
+    playbooks: config?.playbooks ?? [],
+    tasks: config?.tasks ?? [],
+    gatewayLastEvent: last,
+    gatewayPid: gPid,
+    issueDrafts: drafts.map((d) => ({
+      fingerprint: d.fingerprint,
+      title: d.title,
+      source: d.source,
+      createdAt: d.createdAt,
+      path: d.path,
+    })),
+  };
+
+  if (process.argv.includes("--json")) {
+    printJson(json);
+    return;
+  }
+
+  const lines = [
+    `# harness daily summary (on-demand)`,
+    ``,
+    `Generated: ${json.generatedAt}`,
+    `Version: ${VERSION}`,
+    ``,
+    `## Session`,
+    `- started: ${state.started} at ${state.startedAt ?? "—"}`,
+    `- sessionId: ${state.sessionId ?? "—"}`,
+    `- lastPicked: ${state.lastPicked ? `${state.lastPicked.id} (${state.lastPicked.kind})` : "—"}`,
+    ``,
+    `## Playbooks`,
+    ...(config?.playbooks?.length
+      ? config.playbooks.map((p) => `- \`${p.id}\` ${p.description ?? ""}`.trim())
+      : [`- (none; bundled id \`${PLAYBOOK_SENTRY}\`)`]),
+    ``,
+    `## Mock issue drafts (${drafts.length}) — GitHub not called`,
+    ...(!drafts.length
+      ? ["- none"]
+      : drafts.map((d) => `- ${d.createdAt} \`${d.fingerprint}\` ${d.title} (${d.path})`)),
+    ``,
+    `## Gateway last event`,
+    last
+      ? `- ${last.at} ${last.source} taskId=${last.taskId} freeform=${last.freeform}`
+      : `- none`,
+    ``,
+    `No cron. Run \`harness summary\` when you want a report.`,
+    ``,
+  ];
+  console.log(lines.join("\n"));
+}
+
 async function cmdGateway() {
   const sub = process.argv[3];
   if (sub === "start") return await cmdGatewayStart();
@@ -491,6 +702,10 @@ Usage:
   harness gateway start [--foreground]  Local HTTP ingress (default 127.0.0.1:8787)
   harness gateway status                Pid, bind, lastEvent
   harness gateway stop                  Stop background gateway
+  harness issues ingest --source sentry|bugsink [--file PATH]
+  harness issues list                   Mock GH issue drafts (no GitHub API)
+  harness pick                          Next task: mock issues > config tasks > freeform
+  harness summary                       On-demand markdown report (no cron)
 
 Ctrl+G = restart + resume (user herdr config binds plugin_action harness.resume).
 CLI path: harness resume. Plugins cannot declare keybindings.
@@ -516,6 +731,29 @@ switch (cmd) {
     break;
   case "gateway":
     await cmdGateway();
+    break;
+  case "issues":
+    await cmdIssues();
+    break;
+  case "pick":
+    cmdPick();
+    break;
+  case "tasks":
+    if (process.argv[3] === "pick") cmdPick();
+    else {
+      console.error("usage: harness tasks pick");
+      process.exit(1);
+    }
+    break;
+  case "summary":
+    cmdSummary();
+    break;
+  case "report":
+    if (process.argv[3] === "daily") cmdSummary();
+    else {
+      console.error("usage: harness report daily");
+      process.exit(1);
+    }
     break;
   case "-h":
   case "--help":

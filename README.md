@@ -2,7 +2,7 @@
 
 Persistent local agent harness. Separate from [herdr-desk](https://github.com/duyet/herdr-desk) (cron desk).
 
-Plugin id: `harness` · version from `package.json` (0.0.4)
+Plugin id: `harness` · version from `package.json` (0.0.5)
 
 ## Local install / link
 
@@ -34,6 +34,10 @@ herdr --session harness plugin action list --plugin harness
 | `harness gateway start` | Background localhost HTTP ingress (default `127.0.0.1:8787`) |
 | `harness gateway status` | Listening?, pid, bind, lastEvent |
 | `harness gateway stop` | Stop by pid file |
+| `harness issues ingest --source sentry\|bugsink` | Mock GH issue draft from JSON stdin/`--file` (no GitHub API) |
+| `harness issues list` | Drafts under `~/.local/state/herdr-harness/issues/` |
+| `harness pick` | Next work: mock issues → named tasks (list order) → freeform queue |
+| `harness summary` | On-demand markdown report (`--json` ok). **No cron.** |
 
 ## Ctrl+G (user config, not the plugin)
 
@@ -60,6 +64,24 @@ Walk up from cwd for `.herdr-harness.json`, else `examples/minimal/.herdr-harnes
 - `adapters.routes` — grok-build, claude, anyr, codex, opencode
 - `tasks` — id + adapter + optional worktree stub
 - `soul` — [`templates/soul.md`](./templates/soul.md)
+- `playbooks` — includes `desk:sentry-issues` (Sentry/Bugsink → mock GH issues)
+
+## Mock issues + pick/summary (on-demand)
+
+Playbook **`desk:sentry-issues`**. Ingest never calls GitHub.
+
+```bash
+echo '{"event_id":"abc","project":"harness","message":"TypeError: boom","culprit":"src/cli.ts","level":"error"}' \
+  | harness issues ingest --source sentry
+harness issues ingest --source bugsink --file event.json
+harness issues list
+harness pick --json
+harness summary
+```
+
+Gateway (restart after upgrade so new routes load): `POST /ingress/sentry` and `POST /ingress/bugsink`.
+
+**Pick order:** mock issue drafts, then config `tasks` in list order (rotates after last pick), then freeform ingress. **Summary is CLI-only — no scheduler.**
 
 ## Gateway / chat ingress (stub)
 
@@ -92,4 +114,4 @@ Ingress returns **202** and runs manager route in-process (no herdr spawn). Queu
 
 ## Not in this MVP
 
-Fleet metrics, release-please, full child-agent spawn, live Matrix/Telegram.
+Fleet metrics, release-please, full child-agent spawn, live Matrix/Telegram, GitHub issue create, cron.

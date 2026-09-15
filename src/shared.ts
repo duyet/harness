@@ -11,6 +11,8 @@ export const GATEWAY_PID_FILE = join(STATE_DIR, "gateway.pid");
 export const GATEWAY_META_FILE = join(STATE_DIR, "gateway.json");
 export const INGRESS_QUEUE_FILE = join(STATE_DIR, "ingress-queue.json");
 export const LAST_INGRESS_FILE = join(STATE_DIR, "last-ingress.json");
+export const ISSUES_DIR = join(STATE_DIR, "issues");
+export const PLAYBOOK_SENTRY = "desk:sentry-issues";
 
 export const RESTART_RESUME_HINT =
   "Press Ctrl+G in the agent to restart and resume.";
@@ -23,6 +25,7 @@ export type State = {
   installedVersion?: string;
   installedRoot?: string;
   gitDescribe?: string;
+  lastPicked?: { id: string; kind: string; adapter?: string; at: string };
 };
 
 export type AdapterRoute = {
@@ -43,12 +46,15 @@ export type Task = {
   worktree?: { branch?: string; base?: string; path?: string; label?: string };
 };
 
+export type Playbook = { id: string; description?: string };
+
 export type HarnessConfig = {
   name?: string;
   agent?: string;
   soul?: string;
   adapters?: Adapters;
   tasks?: Task[];
+  playbooks?: Playbook[];
 };
 
 export function packageVersion(): string {

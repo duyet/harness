@@ -9,6 +9,7 @@ import {
   resolveTask,
   gatewayBind,
 } from "./shared.ts";
+import { ingestErrorEvent } from "./issues.ts";
 
 export type IngressEvent = {
   at: string;
@@ -161,6 +162,16 @@ export function startGatewayServer() {
         const body = (await req.json()) as Record<string, unknown>;
         const result = handleIngress("telegram", body);
         return Response.json(result, { status: 202 });
+      }
+      if (req.method === "POST" && url.pathname === "/ingress/sentry") {
+        const body = (await req.json()) as Record<string, unknown>;
+        const draft = ingestErrorEvent("sentry", body);
+        return Response.json({ ok: true, source: "sentry", queued: true, draft }, { status: 202 });
+      }
+      if (req.method === "POST" && url.pathname === "/ingress/bugsink") {
+        const body = (await req.json()) as Record<string, unknown>;
+        const draft = ingestErrorEvent("bugsink", body);
+        return Response.json({ ok: true, source: "bugsink", queued: true, draft }, { status: 202 });
       }
       return Response.json({ ok: false, error: "not found" }, { status: 404 });
     },
