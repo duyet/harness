@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/duyet/harness/main/herdr-harness.schema.json",
+  "title": "herdr-harness repo config",
+  "description": "Per-repo harness config. Adapters are a routing table. tasks map ids to adapters and optional worktree spawn stubs.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "name": { "type": "string", "minLength": 1 },
+    "enabled": { "type": "boolean", "default": true },
+    "agent": {
+      "type": "string",
+      "description": "Preferred CLI adapter id. Prefer adapters.default when both are set."
+    },
+    "soul": {
+      "type": "string",
+      "description": "Path to soul.md identity file. Bundled stub: templates/soul.md"
+    },
+    "adapters": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Routing table only.",
+      "properties": {
+        "default": { "type": "string" },
+        "routes": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/adapterRoute" }
+        }
+      }
+    },
+    "tasks": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/task" }
+    }
+  },
+  "$defs": {
+    "adapterRoute": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "type": "string" },
+        "model": { "type": "string" },
+        "via": { "type": "string" },
+        "flags": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "task": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "adapter": { "type": "string" },
+        "worktree": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "branch": { "type": "string" },
+            "base": { "type": "string" },
+            "path": { "type": "string" },
+            "label": { "type": "string" }
+          }
+        }
+      }
+    }
+  }
+}

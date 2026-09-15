@@ -1,0 +1,27 @@
+{
+  "$schema": "../../herdr-harness.schema.json",
+  "name": "example-repo",
+  "enabled": true,
+  "agent": "grok-build",
+  "soul": "templates/soul.md",
+  "adapters": {
+    "default": "grok-build",
+    "routes": {
+      "grok-build": { "kind": "grok", "model": "grok-build" },
+      "claude": { "kind": "claude" },
+      "anyr": { "kind": "anyr", "via": "claude" },
+      "codex": { "kind": "codex", "flags": ["--yolo"] },
+      "opencode": { "kind": "opencode", "flags": ["--agent", "build"] }
+    }
+  },
+  "tasks": [
+    {
+      "id": "mvp-review",
+      "adapter": "grok-build",
+      "worktree": { "branch": "harness/mvp-review" }
+    },
+    { "id": "docs", "adapter": "claude" },
+    { "id": "anyr-via", "adapter": "anyr" },
+    { "id": "codex-task", "adapter": "codex" }
+  ]
+}

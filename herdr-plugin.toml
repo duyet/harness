@@ -1,0 +1,29 @@
+id = "harness"
+name = "Harness"
+version = "0.0.3"
+description = "Persistent local agent harness. Separate from herdr-desk."
+min_herdr_version = "0.7.0"
+platforms = ["linux", "macos"]
+
+[[startup]]
+command = ["bin/harness", "start"]
+
+[[actions]]
+id = "start"
+title = "Start the local harness"
+command = ["bin/harness", "start"]
+
+[[actions]]
+id = "status"
+title = "Show harness status"
+command = ["bin/harness", "status"]
+
+[[actions]]
+id = "upgrade"
+title = "Check for CLI upgrades (stub)"
+command = ["bin/harness", "upgrade"]
+
+[[actions]]
+id = "resume"
+title = "Restart + resume last harness session (bind as Ctrl+G via user config)"
+command = ["bin/harness", "resume"]

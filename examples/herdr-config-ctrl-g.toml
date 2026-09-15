@@ -1,0 +1,8 @@
+# Copy into ~/.config/herdr/config.toml
+# Plugins cannot declare keybindings. Bind plugin_action to plugin_id.action_id.
+
+[[keys.command]]
+key = "ctrl+g"
+type = "plugin_action"
+command = "harness.resume"
+description = "restart + resume harness session"

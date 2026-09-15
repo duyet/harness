@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Herdr event PATH is often empty — put bun on it.
+export PATH="${HOME}/.bun/bin:/usr/local/bin:/usr/bin:${PATH}"
+SCRIPT="$(readlink -f "$0" 2>/dev/null || realpath "$0")"
+ROOT="${HERDR_PLUGIN_ROOT:-$(cd "$(dirname "$SCRIPT")/.." && pwd)}"
+exec bun "${ROOT}/src/cli.ts" "$@"
