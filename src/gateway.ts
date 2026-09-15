@@ -1,6 +1,8 @@
 import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { join } from "node:path";
 import {
   VERSION,
+  ROOT,
   STATE_DIR,
   INGRESS_QUEUE_FILE,
   LAST_INGRESS_FILE,
@@ -11,9 +13,11 @@ import {
 } from "./shared.ts";
 import { ingestErrorEvent } from "./issues.ts";
 
+const CHAT_HTML = join(ROOT, "src", "static", "chat.html");
+
 export type IngressEvent = {
   at: string;
-  source: "matrix" | "telegram";
+  source: "matrix" | "telegram" | "chat";
   taskId: string | null;
   text: string | null;
   sender: string | null;
@@ -78,8 +82,18 @@ function normalizeTelegram(raw: Record<string, unknown>) {
   return { text, sender, channel, taskId: extractTaskId(nested, text) };
 }
 
-export function handleIngress(source: "matrix" | "telegram", raw: Record<string, unknown>) {
-  const norm = source === "matrix" ? normalizeMatrix(raw) : normalizeTelegram(raw);
+function normalizeChat(raw: Record<string, unknown>) {
+  const text = typeof raw.text === "string" ? raw.text : typeof raw.body === "string" ? raw.body : null;
+  return { text, sender: "chat-ui", channel: "local", taskId: extractTaskId(raw, text) };
+}
+
+export function handleIngress(source: "matrix" | "telegram" | "chat", raw: Record<string, unknown>) {
+  const norm =
+    source === "matrix"
+      ? normalizeMatrix(raw)
+      : source === "telegram"
+        ? normalizeTelegram(raw)
+        : normalizeChat(raw);
   const { config } = loadConfig();
   const defaultAdapter = config?.adapters?.default ?? config?.agent ?? "grok-build";
   let route: ReturnType<typeof resolveTask> | { error: string; defaultAdapter: string; freeform: true };
@@ -130,6 +144,24 @@ export function handleIngress(source: "matrix" | "telegram", raw: Record<string,
   };
 }
 
+function stubReply(result: ReturnType<typeof handleIngress>): string {
+  const t = result.task;
+  if (t.freeform) {
+    return `stub: freeform via ${t.adapterId} — ${t.text ?? "(empty)"}`;
+  }
+  const kind = result.route && typeof result.route === "object" && "kind" in result.route
+    ? String((result.route as { kind?: string }).kind)
+    : t.adapterId;
+  return `stub: routed task ${t.id} → adapter ${t.adapterId} (${kind}). No LLM.`;
+}
+
+function chatPage(): Response {
+  const html = existsSync(CHAT_HTML)
+    ? readFileSync(CHAT_HTML, "utf8")
+    : "<!doctype html><title>Harness chat</title><p>missing src/static/chat.html</p>";
+  return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
+}
+
 export function lastIngress(): IngressEvent | null {
   return readJsonFile<IngressEvent | null>(LAST_INGRESS_FILE, null);
 }
@@ -141,8 +173,23 @@ export function startGatewayServer() {
     port: bind.port,
     async fetch(req) {
       const url = new URL(req.url);
-      if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
+      if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/chat")) {
+        return chatPage();
+      }
+      if (req.method === "GET" && url.pathname === "/health") {
         return Response.json({ ok: true, service: "harness-gateway", version: VERSION, bind });
+      }
+      if (req.method === "POST" && url.pathname === "/chat") {
+        const body = (await req.json()) as Record<string, unknown>;
+        const result = handleIngress("chat", body);
+        return Response.json({
+          ok: true,
+          reply: stubReply(result),
+          task: result.task,
+          route: result.route,
+          lastEvent: result.lastEvent,
+          queued: result.queued,
+        });
       }
       if (req.method === "GET" && url.pathname === "/status") {
         return Response.json({

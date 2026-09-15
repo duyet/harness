@@ -1,6 +1,6 @@
 id = "harness"
 name = "Harness"
-version = "0.0.5"
+version = "0.0.6"
 description = "Persistent local agent harness. Separate from herdr-desk."
 min_herdr_version = "0.7.0"
 platforms = ["linux", "macos"]

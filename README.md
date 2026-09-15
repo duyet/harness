@@ -2,7 +2,7 @@
 
 Persistent local agent harness. Separate from [herdr-desk](https://github.com/duyet/herdr-desk) (cron desk).
 
-Plugin id: `harness` · version from `package.json` (0.0.5)
+Plugin id: `harness` · version from `package.json` (0.0.6)
 
 ## Local install / link
 
@@ -31,7 +31,7 @@ herdr --session harness plugin action list --plugin harness
 | `harness manager status` | Adapters, routes, tasks from `.herdr-harness.json` |
 | `harness manager route <taskId>` | Resolve task → adapter JSON |
 | `harness manager spawn <taskId>` | Dry-run `herdr worktree create` unless `--execute` and Herdr is usable |
-| `harness gateway start` | Background localhost HTTP ingress (default `127.0.0.1:8787`) |
+| `harness gateway start` | Background localhost HTTP + chat UI (`http://127.0.0.1:8787/`) |
 | `harness gateway status` | Listening?, pid, bind, lastEvent |
 | `harness gateway stop` | Stop by pid file |
 | `harness issues ingest --source sentry\|bugsink` | Mock GH issue draft from JSON stdin/`--file` (no GitHub API) |
@@ -89,8 +89,11 @@ Local HTTP only. **Never talks to real Matrix or Telegram APIs.** Tokens are unu
 
 ```bash
 harness gateway start
-harness gateway status
+# open http://127.0.0.1:8787/  (HTML chat; /chat same)
 curl -sS http://127.0.0.1:8787/health
+curl -sS -X POST http://127.0.0.1:8787/chat \
+  -H 'content-type: application/json' \
+  -d '{"text":"task: mvp-review"}'
 curl -sS -D- -X POST http://127.0.0.1:8787/ingress/matrix \
   -H 'content-type: application/json' \
   -d '{"room_id":"!fake:localhost","sender":"@alice:localhost","content":{"body":"task: mvp-review please"},"taskId":"mvp-review"}'
@@ -111,6 +114,39 @@ Ingress returns **202** and runs manager route in-process (no herdr spawn). Queu
 | `HARNESS_MATRIX_TOKEN` | unused | Matrix client |
 | `HARNESS_MATRIX_HOMESERVER` | unused | Matrix client |
 | `HARNESS_TELEGRAM_BOT_TOKEN` | unused | Telegram bot |
+
+## Persistent Herdr host / VM install
+
+This is **not** a new hypervisor. Install on an existing Herdr host, VM, or box.
+
+```bash
+# 1. CLI on PATH
+chmod +x /path/to/harness/bin/harness
+ln -sfn /path/to/harness/bin/harness ~/.local/bin/harness
+export PATH="$HOME/.local/bin:$PATH"
+harness upgrade    # local relink if checkout moved/version bumped
+
+# 2. Herdr plugin (needed for Ctrl+G plugin_action)
+herdr --session harness plugin link /path/to/harness
+
+# 3. Ctrl+G in ~/.config/herdr/config.toml
+# [[keys.command]]
+# key = "ctrl+g"
+# type = "plugin_action"
+# command = "harness.resume"
+# description = "restart + resume harness session"
+herdr --session harness server reload-config
+
+# 4. State lives here (sessions, gateway pid, mock issues, lastEvent)
+# ~/.local/state/herdr-harness
+
+# 5. Chat UI + ingress
+harness gateway start
+# open http://127.0.0.1:8787/   or  /chat
+# GET /health remains JSON
+```
+
+After an in-place upgrade, **Press Ctrl+G in the agent to restart and resume.** Restart the gateway process so new HTTP routes load.
 
 ## Not in this MVP
 
