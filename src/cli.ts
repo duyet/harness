@@ -1,115 +1,38 @@
 #!/usr/bin/env bun
-import { mkdirSync, readFileSync, writeFileSync, existsSync, realpathSync, symlinkSync, unlinkSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
-import { join, dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
-import { spawnSync } from "node:child_process";
+import { dirname, join, resolve } from "node:path";
+import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import {
+  ROOT,
+  STATE_DIR,
+  STATE_FILE,
+  GATEWAY_PID_FILE,
+  GATEWAY_META_FILE,
+  VERSION,
+  RESTART_RESUME_HINT,
+  loadState,
+  saveState,
+  loadConfig,
+  gitDescribe,
+  resolveTask,
+  printJson,
+  gatewayBind,
+  type State,
+} from "./shared.ts";
+import { lastIngress } from "./gateway.ts";
 
-const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const BIN_PATH = join(ROOT, "bin", "harness");
 const LINK_PATH = join(homedir(), ".local", "bin", "harness");
-const STATE_DIR = join(homedir(), ".local", "state", "herdr-harness");
-const STATE_FILE = join(STATE_DIR, "state.json");
-
-/** After an in-place upgrade, a running agent still has the old process in memory. */
-const RESTART_RESUME_HINT =
-  "Press Ctrl+G in the agent to restart and resume.";
-
-type State = {
-  started: boolean;
-  startedAt?: string;
-  sessionId?: string;
-  agent?: string;
-  installedVersion?: string;
-  installedRoot?: string;
-  gitDescribe?: string;
-};
-
-type AdapterRoute = {
-  kind?: string;
-  model?: string;
-  via?: string;
-  flags?: string[];
-};
-
-type Adapters = {
-  default?: string;
-  routes?: Record<string, AdapterRoute>;
-};
-
-type Task = {
-  id: string;
-  adapter?: string;
-  worktree?: { branch?: string; base?: string; path?: string; label?: string };
-};
-
-type HarnessConfig = {
-  name?: string;
-  agent?: string;
-  soul?: string;
-  adapters?: Adapters;
-  tasks?: Task[];
-};
-
-function packageVersion(): string {
-  try {
-    const pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8"));
-    return String(pkg.version ?? "0.0.0");
-  } catch {
-    return "0.0.0";
-  }
-}
-
-const VERSION = packageVersion();
-
-function gitDescribe(): string | null {
-  const r = spawnSync("git", ["describe", "--tags", "--always"], {
-    cwd: ROOT,
-    encoding: "utf8",
-  });
-  if (r.status !== 0) return null;
-  const s = (r.stdout || "").trim();
-  return s || null;
-}
-
-function loadState(): State {
-  if (!existsSync(STATE_FILE)) return { started: false };
-  try {
-    return JSON.parse(readFileSync(STATE_FILE, "utf8")) as State;
-  } catch {
-    return { started: false };
-  }
-}
-
-function saveState(state: State) {
-  mkdirSync(STATE_DIR, { recursive: true });
-  writeFileSync(STATE_FILE, `${JSON.stringify(state, null, 2)}\n`);
-}
-
-function findConfigPath(): string | null {
-  let dir = process.cwd();
-  for (;;) {
-    const candidate = join(dir, ".herdr-harness.json");
-    if (existsSync(candidate)) return candidate;
-    const parent = dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
-  }
-  const example = join(ROOT, "examples", "minimal", ".herdr-harness.json");
-  if (existsSync(example)) return example;
-  return null;
-}
-
-function loadConfig(): { path: string | null; config: HarnessConfig | null } {
-  const path = findConfigPath();
-  if (!path) return { path: null, config: null };
-  try {
-    return { path, config: JSON.parse(readFileSync(path, "utf8")) as HarnessConfig };
-  } catch {
-    return { path, config: null };
-  }
-}
 
 function argvFlags(from = 3): Set<string> {
   return new Set(process.argv.slice(from).filter((a) => a.startsWith("-")));
@@ -125,10 +48,6 @@ function resolvedLinkTarget(): string | null {
   } catch {
     return null;
   }
-}
-
-function printJson(obj: unknown) {
-  console.log(JSON.stringify(obj, null, 2));
 }
 
 function cmdStart() {
@@ -294,30 +213,6 @@ function herdrUsable(): { ok: boolean; reason: string; bin: string } {
   return { ok: true, reason: "herdr binary + socket present", bin };
 }
 
-function resolveTask(taskId: string | undefined) {
-  const { path: configPath, config } = loadConfig();
-  const tasks = config?.tasks ?? [];
-  const adapters = config?.adapters?.routes ?? {};
-  const defaultAdapter = config?.adapters?.default ?? config?.agent ?? "grok-build";
-  if (!taskId) {
-    return { error: "missing taskId", configPath, defaultAdapter, tasks, adapters };
-  }
-  const task = tasks.find((t) => t.id === taskId);
-  if (!task) {
-    return { error: `unknown task: ${taskId}`, configPath, defaultAdapter, tasks, adapters };
-  }
-  const adapterId = task.adapter ?? defaultAdapter;
-  const route = adapters[adapterId] ?? null;
-  return {
-    error: null,
-    configPath,
-    task,
-    adapterId,
-    route,
-    defaultAdapter,
-  };
-}
-
 function cmdManager() {
   const sub = process.argv[3];
   if (sub === "status") return cmdManagerStatus();
@@ -435,6 +330,153 @@ function cmdManagerSpawn() {
   });
 }
 
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function readPid(): number | null {
+  if (!existsSync(GATEWAY_PID_FILE)) return null;
+  const n = Number(readFileSync(GATEWAY_PID_FILE, "utf8").trim());
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+function gatewayListening(): { pid: number | null; bind: ReturnType<typeof gatewayBind>; alive: boolean; lastEvent: unknown } {
+  const pid = readPid();
+  const alive = pid != null && pidAlive(pid);
+  let bind = gatewayBind();
+  if (existsSync(GATEWAY_META_FILE)) {
+    try {
+      const meta = JSON.parse(readFileSync(GATEWAY_META_FILE, "utf8"));
+      if (meta.bind) bind = meta.bind;
+    } catch {
+      /* ignore */
+    }
+  }
+  return { pid, bind, alive, lastEvent: lastIngress() };
+}
+
+async function waitHealth(bind: { hostname: string; port: number }, timeoutMs = 4000) {
+  const url = `http://${bind.hostname}:${bind.port}/health`;
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const r = await fetch(url);
+      if (r.ok) return true;
+    } catch {
+      /* retry */
+    }
+    await Bun.sleep(80);
+  }
+  return false;
+}
+
+async function cmdGatewayStart() {
+  const foreground = argvFlags(4).has("--foreground");
+  const bind = gatewayBind();
+  const current = gatewayListening();
+  if (current.alive && !foreground) {
+    printJson({
+      ok: true,
+      alreadyRunning: true,
+      pid: current.pid,
+      bind: current.bind,
+      lastEvent: current.lastEvent,
+    });
+    return;
+  }
+  if (foreground) {
+    const { startGatewayServer } = await import("./gateway.ts");
+    mkdirSync(STATE_DIR, { recursive: true });
+    writeFileSync(GATEWAY_PID_FILE, `${process.pid}\n`);
+    startGatewayServer();
+    return;
+  }
+
+  mkdirSync(STATE_DIR, { recursive: true });
+  const child = spawn("bun", [join(ROOT, "src", "gateway.ts")], {
+    detached: true,
+    stdio: "ignore",
+    env: { ...process.env },
+    cwd: ROOT,
+  });
+  if (child.pid == null) {
+    printJson({ ok: false, error: "failed to spawn gateway" });
+    process.exit(1);
+  }
+  child.unref();
+  writeFileSync(GATEWAY_PID_FILE, `${child.pid}\n`);
+  const ready = await waitHealth(bind);
+  printJson({
+    ok: ready,
+    pid: child.pid,
+    bind,
+    listening: ready,
+    alreadyRunning: false,
+  });
+  if (!ready) process.exit(1);
+}
+
+function cmdGatewayStatus() {
+  const g = gatewayListening();
+  printJson({
+    ok: true,
+    listening: g.alive,
+    pid: g.pid,
+    bind: g.bind,
+    lastEvent: g.lastEvent,
+    version: VERSION,
+  });
+}
+
+function cmdGatewayStop() {
+  const pid = readPid();
+  if (pid == null || !pidAlive(pid)) {
+    printJson({ ok: true, stopped: false, reason: "not running" });
+    return;
+  }
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch (e) {
+    printJson({ ok: false, error: String(e) });
+    process.exit(1);
+  }
+  const deadline = Date.now() + 2000;
+  while (Date.now() < deadline && pidAlive(pid)) {
+    spawnSync("sleep", ["0.05"]);
+  }
+  if (pidAlive(pid)) {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      /* ignore */
+    }
+  }
+  try {
+    unlinkSync(GATEWAY_PID_FILE);
+  } catch {
+    /* ignore */
+  }
+  printJson({ ok: true, stopped: true, pid });
+}
+
+async function cmdGateway() {
+  const sub = process.argv[3];
+  if (sub === "start") return await cmdGatewayStart();
+  if (sub === "status") return cmdGatewayStatus();
+  if (sub === "stop") return cmdGatewayStop();
+  printJson({
+    ok: false,
+    error: sub ? `unknown gateway subcommand: ${sub}` : "missing gateway subcommand",
+    usage: ["harness gateway start [--foreground]", "harness gateway status", "harness gateway stop"],
+  });
+  process.exit(1);
+}
+
 function usage() {
   console.log(`harness ${VERSION} — Herdr plugin CLI
 
@@ -446,6 +488,9 @@ Usage:
   harness manager status                List adapters, routes, tasks
   harness manager route <taskId>        Resolve task → adapter
   harness manager spawn <taskId>        Dry-run worktree spawn (--execute to try herdr)
+  harness gateway start [--foreground]  Local HTTP ingress (default 127.0.0.1:8787)
+  harness gateway status                Pid, bind, lastEvent
+  harness gateway stop                  Stop background gateway
 
 Ctrl+G = restart + resume (user herdr config binds plugin_action harness.resume).
 CLI path: harness resume. Plugins cannot declare keybindings.
@@ -468,6 +513,9 @@ switch (cmd) {
     break;
   case "manager":
     cmdManager();
+    break;
+  case "gateway":
+    await cmdGateway();
     break;
   case "-h":
   case "--help":

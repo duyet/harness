@@ -1,0 +1,147 @@
+import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
+
+export const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+export const STATE_DIR = join(homedir(), ".local", "state", "herdr-harness");
+export const STATE_FILE = join(STATE_DIR, "state.json");
+export const GATEWAY_PID_FILE = join(STATE_DIR, "gateway.pid");
+export const GATEWAY_META_FILE = join(STATE_DIR, "gateway.json");
+export const INGRESS_QUEUE_FILE = join(STATE_DIR, "ingress-queue.json");
+export const LAST_INGRESS_FILE = join(STATE_DIR, "last-ingress.json");
+
+export const RESTART_RESUME_HINT =
+  "Press Ctrl+G in the agent to restart and resume.";
+
+export type State = {
+  started: boolean;
+  startedAt?: string;
+  sessionId?: string;
+  agent?: string;
+  installedVersion?: string;
+  installedRoot?: string;
+  gitDescribe?: string;
+};
+
+export type AdapterRoute = {
+  kind?: string;
+  model?: string;
+  via?: string;
+  flags?: string[];
+};
+
+export type Adapters = {
+  default?: string;
+  routes?: Record<string, AdapterRoute>;
+};
+
+export type Task = {
+  id: string;
+  adapter?: string;
+  worktree?: { branch?: string; base?: string; path?: string; label?: string };
+};
+
+export type HarnessConfig = {
+  name?: string;
+  agent?: string;
+  soul?: string;
+  adapters?: Adapters;
+  tasks?: Task[];
+};
+
+export function packageVersion(): string {
+  try {
+    const pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8"));
+    return String(pkg.version ?? "0.0.0");
+  } catch {
+    return "0.0.0";
+  }
+}
+
+export const VERSION = packageVersion();
+
+export function gitDescribe(): string | null {
+  const r = spawnSync("git", ["describe", "--tags", "--always"], {
+    cwd: ROOT,
+    encoding: "utf8",
+  });
+  if (r.status !== 0) return null;
+  const s = (r.stdout || "").trim();
+  return s || null;
+}
+
+export function loadState(): State {
+  if (!existsSync(STATE_FILE)) return { started: false };
+  try {
+    return JSON.parse(readFileSync(STATE_FILE, "utf8")) as State;
+  } catch {
+    return { started: false };
+  }
+}
+
+export function saveState(state: State) {
+  mkdirSync(STATE_DIR, { recursive: true });
+  writeFileSync(STATE_FILE, `${JSON.stringify(state, null, 2)}\n`);
+}
+
+export function findConfigPath(): string | null {
+  let dir = process.cwd();
+  for (;;) {
+    const candidate = join(dir, ".herdr-harness.json");
+    if (existsSync(candidate)) return candidate;
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  const example = join(ROOT, "examples", "minimal", ".herdr-harness.json");
+  if (existsSync(example)) return example;
+  return null;
+}
+
+export function loadConfig(): { path: string | null; config: HarnessConfig | null } {
+  const path = findConfigPath();
+  if (!path) return { path: null, config: null };
+  try {
+    return { path, config: JSON.parse(readFileSync(path, "utf8")) as HarnessConfig };
+  } catch {
+    return { path, config: null };
+  }
+}
+
+export function resolveTask(taskId: string | undefined) {
+  const { path: configPath, config } = loadConfig();
+  const tasks = config?.tasks ?? [];
+  const adapters = config?.adapters?.routes ?? {};
+  const defaultAdapter = config?.adapters?.default ?? config?.agent ?? "grok-build";
+  if (!taskId) {
+    return { error: "missing taskId", configPath, defaultAdapter, tasks, adapters };
+  }
+  const task = tasks.find((t) => t.id === taskId);
+  if (!task) {
+    return { error: `unknown task: ${taskId}`, configPath, defaultAdapter, tasks, adapters };
+  }
+  const adapterId = task.adapter ?? defaultAdapter;
+  const route = adapters[adapterId] ?? null;
+  return {
+    error: null as string | null,
+    configPath,
+    task,
+    adapterId,
+    route,
+    defaultAdapter,
+    adapters,
+    tasks,
+  };
+}
+
+export function printJson(obj: unknown) {
+  console.log(JSON.stringify(obj, null, 2));
+}
+
+export function gatewayBind() {
+  const hostname = process.env.HARNESS_GATEWAY_HOST || "127.0.0.1";
+  const port = Number(process.env.HARNESS_GATEWAY_PORT || "8787");
+  return { hostname, port };
+}

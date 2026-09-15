@@ -1,6 +1,6 @@
 id = "harness"
 name = "Harness"
-version = "0.0.3"
+version = "0.0.4"
 description = "Persistent local agent harness. Separate from herdr-desk."
 min_herdr_version = "0.7.0"
 platforms = ["linux", "macos"]
@@ -27,3 +27,18 @@ command = ["bin/harness", "upgrade"]
 id = "resume"
 title = "Restart + resume last harness session (bind as Ctrl+G via user config)"
 command = ["bin/harness", "resume"]
+
+[[actions]]
+id = "gateway-start"
+title = "Start local Matrix/Telegram gateway stub"
+command = ["bin/harness", "gateway", "start"]
+
+[[actions]]
+id = "gateway-status"
+title = "Show gateway bind, pid, last ingress"
+command = ["bin/harness", "gateway", "status"]
+
+[[actions]]
+id = "gateway-stop"
+title = "Stop local gateway"
+command = ["bin/harness", "gateway", "stop"]

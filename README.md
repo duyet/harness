@@ -2,7 +2,7 @@
 
 Persistent local agent harness. Separate from [herdr-desk](https://github.com/duyet/herdr-desk) (cron desk).
 
-Plugin id: `harness` · version from `package.json` (0.0.3)
+Plugin id: `harness` · version from `package.json` (0.0.4)
 
 ## Local install / link
 
@@ -31,6 +31,9 @@ herdr --session harness plugin action list --plugin harness
 | `harness manager status` | Adapters, routes, tasks from `.herdr-harness.json` |
 | `harness manager route <taskId>` | Resolve task → adapter JSON |
 | `harness manager spawn <taskId>` | Dry-run `herdr worktree create` unless `--execute` and Herdr is usable |
+| `harness gateway start` | Background localhost HTTP ingress (default `127.0.0.1:8787`) |
+| `harness gateway status` | Listening?, pid, bind, lastEvent |
+| `harness gateway stop` | Stop by pid file |
 
 ## Ctrl+G (user config, not the plugin)
 
@@ -58,6 +61,35 @@ Walk up from cwd for `.herdr-harness.json`, else `examples/minimal/.herdr-harnes
 - `tasks` — id + adapter + optional worktree stub
 - `soul` — [`templates/soul.md`](./templates/soul.md)
 
+## Gateway / chat ingress (stub)
+
+Local HTTP only. **Never talks to real Matrix or Telegram APIs.** Tokens are unused placeholders.
+
+```bash
+harness gateway start
+harness gateway status
+curl -sS http://127.0.0.1:8787/health
+curl -sS -D- -X POST http://127.0.0.1:8787/ingress/matrix \
+  -H 'content-type: application/json' \
+  -d '{"room_id":"!fake:localhost","sender":"@alice:localhost","content":{"body":"task: mvp-review please"},"taskId":"mvp-review"}'
+curl -sS -X POST http://127.0.0.1:8787/ingress/telegram \
+  -H 'content-type: application/json' \
+  -d '{"update_id":1,"message":{"message_id":1,"chat":{"id":1,"type":"private"},"from":{"id":1,"username":"bob"},"text":"/run docs","taskId":"docs"}}'
+harness gateway stop
+```
+
+Ingress returns **202** and runs manager route in-process (no herdr spawn). Queue/last event: `~/.local/state/herdr-harness/last-ingress.json`.
+
+### Env (stub)
+
+| Var | Used now | Later |
+| --- | --- | --- |
+| `HARNESS_GATEWAY_HOST` | bind host (default `127.0.0.1`) | |
+| `HARNESS_GATEWAY_PORT` | bind port (default `8787`) | |
+| `HARNESS_MATRIX_TOKEN` | unused | Matrix client |
+| `HARNESS_MATRIX_HOMESERVER` | unused | Matrix client |
+| `HARNESS_TELEGRAM_BOT_TOKEN` | unused | Telegram bot |
+
 ## Not in this MVP
 
-Fleet metrics, release-please, full child-agent spawn, gateway/chat.
+Fleet metrics, release-please, full child-agent spawn, live Matrix/Telegram.
