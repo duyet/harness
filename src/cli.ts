@@ -412,7 +412,7 @@ async function cmdGatewayStart() {
     detached: true,
     stdio: "ignore",
     env: { ...process.env },
-    cwd: ROOT,
+    cwd: process.cwd(),
   });
   if (child.pid == null) {
     printJson({ ok: false, error: "failed to spawn gateway" });

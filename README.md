@@ -87,6 +87,8 @@ Gateway (restart after upgrade so new routes load): `POST /ingress/sentry` and `
 
 Local HTTP only. **Never talks to real Matrix or Telegram APIs.** Tokens are unused placeholders.
 
+A newly started gateway uses the launching cwd to discover repo config (walking upward). Starting again while it is already running does not switch repositories; run `harness gateway stop`, then restart from the desired repo.
+
 ```bash
 harness gateway start
 # open http://127.0.0.1:8787/  (HTML chat; /chat same)

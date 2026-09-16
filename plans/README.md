@@ -34,7 +34,7 @@ Run **001 first**. 002–005 are independent of each other after 001 and may be 
 |------|-------|--------|------------|
 | 001 | Establish an isolated Bun test baseline | DONE | none |
 | 002 | Keep issue-draft writes inside the issues directory | DONE | 001 |
-| 003 | Preserve the caller's repository context in the background gateway | TODO | 001 |
+| 003 | Preserve the caller's repository context in the background gateway | DONE | 001 |
 | 004 | Return predictable JSON errors for invalid gateway requests | TODO | 001 |
 | 005 | Make executed manager failures return a nonzero CLI status | TODO | 001 |
 
