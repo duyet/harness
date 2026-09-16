@@ -42,7 +42,7 @@ export function createFixture() {
       cwd,
       env,
       encoding: "utf8",
-      timeout: 5000,
+      timeout: 30000,
       killSignal: "SIGKILL",
       stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
       input,

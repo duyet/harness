@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { ISSUES_DIR, PLAYBOOK_SENTRY } from "./shared.ts";
 
 export type IssueDraft = {
@@ -66,9 +66,36 @@ export function normalizeErrorEvent(source: "sentry" | "bugsink", raw: Record<st
   };
 }
 
+// Filesystem-safe storage key: ordinary IDs keep the legacy filename; anything
+// else (separators, "..", whitespace, unicode, overlong) is encoded. The `~`
+// prefix namespace is excluded from the direct-ID allowlist so a direct ID can
+// never alias an encoded name.
+const SAFE_KEY_RE = /^[A-Za-z0-9_-]{1,128}$/;
+
+function storageKeyFor(fingerprint: string): string {
+  if (SAFE_KEY_RE.test(fingerprint)) return fingerprint;
+  return `~${createHash("sha256").update(fingerprint).digest("hex")}`;
+}
+
+function draftPathFor(draft: IssueDraft): string {
+  const path = join(ISSUES_DIR, `${draft.source}-${storageKeyFor(draft.fingerprint)}.json`);
+  // Containment check: identifiers are data, never path components that could
+  // escape the issues directory.
+  if (dirname(resolve(path)) !== resolve(ISSUES_DIR)) {
+    throw new Error(`issue draft path escapes issues dir: ${draft.fingerprint}`);
+  }
+  return path;
+}
+
 export function writeIssueDraft(draft: IssueDraft): IssueDraft {
+  if (draft.source !== "sentry" && draft.source !== "bugsink") {
+    throw new Error(`invalid issue source: ${String(draft.source)}`);
+  }
+  if (typeof draft.fingerprint !== "string" || !draft.fingerprint) {
+    throw new Error("issue draft fingerprint must be a non-empty string");
+  }
+  const path = draftPathFor(draft);
   mkdirSync(ISSUES_DIR, { recursive: true });
-  const path = join(ISSUES_DIR, `${draft.source}-${draft.fingerprint}.json`);
   const stored = { ...draft, path };
   writeFileSync(path, `${JSON.stringify(stored, null, 2)}\n`);
   return stored;
