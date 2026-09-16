@@ -148,6 +148,18 @@ harness gateway start
 
 After an in-place upgrade, **Press Ctrl+G in the agent to restart and resume.** Restart the gateway process so new HTTP routes load.
 
+## Verification
+
+Tests run on [Bun](https://bun.sh) with its built-in runner — no Herdr server or gateway needed:
+
+```bash
+bun run test
+```
+
+- `tests/baseline.test.ts` covers session persistence, routing, issue normalization and pick rotation through `src/cli.ts`.
+- Each test runs the CLI in an isolated subprocess fixture under `dist/.test-tmp/` (own `HOME`, cwd and `TMPDIR`); nothing touches the real home or state directories.
+- There are no lint or typecheck gates in this repo, and `bun test` does not typecheck.
+
 ## Not in this MVP
 
 Fleet metrics, release-please, full child-agent spawn, live Matrix/Telegram, GitHub issue create, cron.
