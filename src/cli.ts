@@ -330,14 +330,16 @@ function cmdManagerSpawn() {
       stderr: (r.stderr || "").trim(),
     });
   }
+  const ok = results.every((r) => r.status === 0);
   printJson({
-    ok: results.every((r) => r.status === 0),
+    ok,
     mode: "executed",
     ...resolved,
     intendedCommands,
     results,
     todo: ["tab/agent create after worktree is still a stub"],
   });
+  if (!ok) process.exitCode = 1;
 }
 
 function pidAlive(pid: number): boolean {
