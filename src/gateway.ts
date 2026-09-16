@@ -155,6 +155,49 @@ function stubReply(result: ReturnType<typeof handleIngress>): string {
   return `stub: routed task ${t.id} → adapter ${t.adapterId} (${kind}). No LLM.`;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+type ParsedBody =
+  | { ok: true; body: Record<string, unknown> }
+  | { ok: false; response: Response };
+
+async function parseJsonObject(req: Request): Promise<ParsedBody> {
+  let parsed: unknown;
+  try {
+    parsed = await req.json();
+  } catch {
+    return { ok: false, response: Response.json({ ok: false, error: "invalid JSON" }, { status: 400 }) };
+  }
+  if (!isRecord(parsed)) {
+    return { ok: false, response: Response.json({ ok: false, error: "expected JSON object" }, { status: 400 }) };
+  }
+  return { ok: true, body: parsed };
+}
+
+function recordOr(
+  value: unknown,
+  missing: Record<string, unknown>,
+): Record<string, unknown> | null {
+  if (value == null) return missing;
+  return isRecord(value) ? value : null;
+}
+
+function matrixShape(raw: Record<string, unknown>): boolean {
+  return recordOr(raw.content, {}) !== null;
+}
+
+function telegramShape(raw: Record<string, unknown>): boolean {
+  const message = recordOr(raw.message, raw);
+  if (!message) return false;
+  return recordOr(message.chat, {}) !== null && recordOr(message.from, {}) !== null;
+}
+
+function badPayload(): Response {
+  return Response.json({ ok: false, error: "invalid payload shape" }, { status: 400 });
+}
+
 function chatPage(): Response {
   const html = existsSync(CHAT_HTML)
     ? readFileSync(CHAT_HTML, "utf8")
@@ -166,61 +209,72 @@ export function lastIngress(): IngressEvent | null {
   return readJsonFile<IngressEvent | null>(LAST_INGRESS_FILE, null);
 }
 
+export async function handleGatewayRequest(req: Request, bind: ReturnType<typeof gatewayBind>): Promise<Response> {
+  const url = new URL(req.url);
+  if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/chat")) {
+    return chatPage();
+  }
+  if (req.method === "GET" && url.pathname === "/health") {
+    return Response.json({ ok: true, service: "harness-gateway", version: VERSION, bind });
+  }
+  if (req.method === "POST" && url.pathname === "/chat") {
+    const parsed = await parseJsonObject(req);
+    if (!parsed.ok) return parsed.response;
+    const result = handleIngress("chat", parsed.body);
+    return Response.json({
+      ok: true,
+      reply: stubReply(result),
+      task: result.task,
+      route: result.route,
+      lastEvent: result.lastEvent,
+      queued: result.queued,
+    });
+  }
+  if (req.method === "GET" && url.pathname === "/status") {
+    return Response.json({
+      ok: true,
+      listening: true,
+      version: VERSION,
+      bind,
+      lastEvent: lastIngress(),
+    });
+  }
+  if (req.method === "POST" && url.pathname === "/ingress/matrix") {
+    const parsed = await parseJsonObject(req);
+    if (!parsed.ok) return parsed.response;
+    if (!matrixShape(parsed.body)) return badPayload();
+    const result = handleIngress("matrix", parsed.body);
+    return Response.json(result, { status: 202 });
+  }
+  if (req.method === "POST" && url.pathname === "/ingress/telegram") {
+    const parsed = await parseJsonObject(req);
+    if (!parsed.ok) return parsed.response;
+    if (!telegramShape(parsed.body)) return badPayload();
+    const result = handleIngress("telegram", parsed.body);
+    return Response.json(result, { status: 202 });
+  }
+  if (req.method === "POST" && url.pathname === "/ingress/sentry") {
+    const parsed = await parseJsonObject(req);
+    if (!parsed.ok) return parsed.response;
+    const draft = ingestErrorEvent("sentry", parsed.body);
+    return Response.json({ ok: true, source: "sentry", queued: true, draft }, { status: 202 });
+  }
+  if (req.method === "POST" && url.pathname === "/ingress/bugsink") {
+    const parsed = await parseJsonObject(req);
+    if (!parsed.ok) return parsed.response;
+    const draft = ingestErrorEvent("bugsink", parsed.body);
+    return Response.json({ ok: true, source: "bugsink", queued: true, draft }, { status: 202 });
+  }
+  return Response.json({ ok: false, error: "not found" }, { status: 404 });
+}
+
 export function startGatewayServer() {
   const bind = gatewayBind();
   const server = Bun.serve({
     hostname: bind.hostname,
     port: bind.port,
-    async fetch(req) {
-      const url = new URL(req.url);
-      if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/chat")) {
-        return chatPage();
-      }
-      if (req.method === "GET" && url.pathname === "/health") {
-        return Response.json({ ok: true, service: "harness-gateway", version: VERSION, bind });
-      }
-      if (req.method === "POST" && url.pathname === "/chat") {
-        const body = (await req.json()) as Record<string, unknown>;
-        const result = handleIngress("chat", body);
-        return Response.json({
-          ok: true,
-          reply: stubReply(result),
-          task: result.task,
-          route: result.route,
-          lastEvent: result.lastEvent,
-          queued: result.queued,
-        });
-      }
-      if (req.method === "GET" && url.pathname === "/status") {
-        return Response.json({
-          ok: true,
-          listening: true,
-          version: VERSION,
-          bind,
-          lastEvent: lastIngress(),
-        });
-      }
-      if (req.method === "POST" && url.pathname === "/ingress/matrix") {
-        const body = (await req.json()) as Record<string, unknown>;
-        const result = handleIngress("matrix", body);
-        return Response.json(result, { status: 202 });
-      }
-      if (req.method === "POST" && url.pathname === "/ingress/telegram") {
-        const body = (await req.json()) as Record<string, unknown>;
-        const result = handleIngress("telegram", body);
-        return Response.json(result, { status: 202 });
-      }
-      if (req.method === "POST" && url.pathname === "/ingress/sentry") {
-        const body = (await req.json()) as Record<string, unknown>;
-        const draft = ingestErrorEvent("sentry", body);
-        return Response.json({ ok: true, source: "sentry", queued: true, draft }, { status: 202 });
-      }
-      if (req.method === "POST" && url.pathname === "/ingress/bugsink") {
-        const body = (await req.json()) as Record<string, unknown>;
-        const draft = ingestErrorEvent("bugsink", body);
-        return Response.json({ ok: true, source: "bugsink", queued: true, draft }, { status: 202 });
-      }
-      return Response.json({ ok: false, error: "not found" }, { status: 404 });
+    fetch(req) {
+      return handleGatewayRequest(req, bind);
     },
   });
   mkdirSync(STATE_DIR, { recursive: true });

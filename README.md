@@ -107,6 +107,8 @@ harness gateway stop
 
 Ingress returns **202** and runs manager route in-process (no herdr spawn). Queue/last event: `~/.local/state/herdr-harness/last-ingress.json`.
 
+All five POST routes (`/chat` and `/ingress/matrix`, `/ingress/telegram`, `/ingress/sentry`, `/ingress/bugsink`) return **400** with `{ "ok": false, "error": "..." }` for invalid input: `invalid JSON` for malformed JSON or an empty body; `expected JSON object` for top-level null, arrays or scalars; `invalid payload shape` for non-object Matrix `content` or Telegram `message`, `chat` or `from` containers. Optional containers may be absent or null; Telegram checks `chat` and `from` on the selected message (nested `message`, or the top-level fallback). Empty objects and extra fields remain accepted; this is not full provider-schema validation. Rejected input does not write state. Success statuses remain **200** for `/chat` and **202** for the four ingress routes; GET and unknown-route behavior is unchanged.
+
 ### Env (stub)
 
 | Var | Used now | Later |
