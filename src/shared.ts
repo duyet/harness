@@ -12,6 +12,7 @@ export const GATEWAY_META_FILE = join(STATE_DIR, "gateway.json");
 export const INGRESS_QUEUE_FILE = join(STATE_DIR, "ingress-queue.json");
 export const LAST_INGRESS_FILE = join(STATE_DIR, "last-ingress.json");
 export const ISSUES_DIR = join(STATE_DIR, "issues");
+export const SPAWNS_FILE = join(STATE_DIR, "spawns.json");
 export const PLAYBOOK_SENTRY = "desk:sentry-issues";
 
 export const RESTART_RESUME_HINT =
@@ -90,6 +91,48 @@ export function loadState(): State {
 export function saveState(state: State) {
   mkdirSync(STATE_DIR, { recursive: true });
   writeFileSync(STATE_FILE, `${JSON.stringify(state, null, 2)}\n`);
+}
+
+export type SpawnRecord = {
+  taskId: string;
+  adapterId?: string;
+  agentName?: string;
+  worktreePath?: string;
+  workspaceId?: string;
+  tabId?: string;
+  paneId?: string;
+  cwd?: string;
+  at: string;
+};
+
+export type SpawnsState = { spawns: Record<string, SpawnRecord> };
+
+export function loadSpawns(): SpawnsState {
+  if (!existsSync(SPAWNS_FILE)) return { spawns: {} };
+  try {
+    const parsed = JSON.parse(readFileSync(SPAWNS_FILE, "utf8"));
+    return { spawns: parsed?.spawns ?? {} };
+  } catch {
+    return { spawns: {} };
+  }
+}
+
+export function saveSpawns(state: SpawnsState) {
+  mkdirSync(STATE_DIR, { recursive: true });
+  writeFileSync(SPAWNS_FILE, `${JSON.stringify(state, null, 2)}\n`);
+}
+
+export function saveSpawn(record: SpawnRecord) {
+  const state = loadSpawns();
+  state.spawns[record.taskId] = record;
+  saveSpawns(state);
+}
+
+export function deleteSpawn(taskId: string) {
+  const state = loadSpawns();
+  if (!(taskId in state.spawns)) return;
+  delete state.spawns[taskId];
+  saveSpawns(state);
 }
 
 export function findConfigPath(): string | null {

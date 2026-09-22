@@ -3,12 +3,22 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createFixture } from "./helpers.ts";
 
-const RUNNER = new URL("./fixtures/manager-exit-runner.ts", import.meta.url).href;
+const RUNNER = new URL("./fixtures/manager-spawn-runner.ts", import.meta.url).href;
 let fixture: ReturnType<typeof createFixture>;
 
 function worktreeArgs() {
   return ["worktree", "create", "--cwd", fixture.cwd, "--branch", "fixture-branch",
     "--base", "fixture-base", "--path", join(fixture.root, "worktree"), "--label", "fixture-label", "--no-focus"];
+}
+
+function tabArgs(workspace = "<workspace-id>") {
+  return ["tab", "create", "--workspace", workspace, "--cwd", join(fixture.root, "worktree"),
+    "--label", "harness:fixture-task", "--no-focus"];
+}
+
+// Route kind "fixture" is not a herdr agent kind, so the agent step is a shell fallback.
+function agentArgs(pane = "<pane-id>") {
+  return ["pane", "run", pane, "fixture"];
 }
 
 function run(mode: string) {
@@ -47,11 +57,23 @@ describe("manager spawn exit status", () => {
     const result = run("success");
     expect(result.exit).toBe(0);
     expect(result.json).toMatchObject({ ok: true, mode: "executed", task: { id: "fixture-task" } });
-    expect(result.json.results).toEqual([{
-      command: [join(fixture.root, "bin", "fixture-herdr"), ...worktreeArgs()],
-      status: 0, stdout: "fixture stdout", stderr: "fixture stderr",
-    }]);
-    expect(result.calls).toEqual([["--version"], worktreeArgs()]);
+    expect(result.calls).toEqual([
+      ["--version"],
+      worktreeArgs(),
+      tabArgs("w1"),
+      agentArgs("w1:t2:p1"),
+    ]);
+    expect(result.json.results.map((r: { status: number }) => r.status)).toEqual([0, 0, 0]);
+    expect(result.json.results.map((r: { command: string[] }) => r.command[0]))
+      .toEqual(Array(3).fill(join(fixture.root, "bin", "fixture-herdr")));
+    expect(result.json.spawn).toMatchObject({
+      taskId: "fixture-task",
+      workspaceId: "w1",
+      worktreePath: join(fixture.root, "worktree"),
+      tabId: "w1:t2",
+      paneId: "w1:t2:p1",
+      agentName: "harness:fixture-task",
+    });
   });
 
   test("default dry-run never executes the worktree command", () => {
@@ -59,7 +81,11 @@ describe("manager spawn exit status", () => {
     expect(result.exit).toBe(0);
     expect(result.json).toMatchObject({ ok: true, mode: "dry-run", herdr: { ok: true } });
     expect(result.json.skippedExecute).toContain("default is dry-run");
-    expect(result.json.intendedCommands).toEqual([["herdr", ...worktreeArgs()]]);
+    expect(result.json.intendedCommands).toEqual([
+      ["herdr", ...worktreeArgs()],
+      ["herdr", ...tabArgs()],
+      ["herdr", ...agentArgs()],
+    ]);
     expect(result.json.results).toBeUndefined();
     expect(result.calls).toEqual([["--version"]]);
   });
@@ -69,7 +95,11 @@ describe("manager spawn exit status", () => {
     expect(result.exit).toBe(0);
     expect(result.json).toMatchObject({ ok: true, mode: "dry-run", herdr: { ok: false } });
     expect(result.json.skippedExecute).toBe(result.json.herdr.reason);
-    expect(result.json.intendedCommands).toEqual([["herdr", ...worktreeArgs()]]);
+    expect(result.json.intendedCommands).toEqual([
+      ["herdr", ...worktreeArgs()],
+      ["herdr", ...tabArgs()],
+      ["herdr", ...agentArgs()],
+    ]);
     expect(result.json.results).toBeUndefined();
     expect(result.calls).toEqual([["--version"]]);
   });

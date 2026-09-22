@@ -30,7 +30,8 @@ herdr --session harness plugin action list --plugin harness
 | `harness upgrade` | Local relink of `~/.local/bin/harness` |
 | `harness manager status` | Adapters, routes, tasks from `.herdr-harness.json` |
 | `harness manager route <taskId>` | Resolve task → adapter JSON |
-| `harness manager spawn <taskId>` | Dry-run `herdr worktree create` unless `--execute` and Herdr is usable |
+| `harness manager spawn <taskId>` | Dry-run `herdr worktree create` + `tab create` + agent start unless `--execute` and Herdr is usable; `--replace` cleans up first, `--cleanup` only cleans up |
+| `harness manager cleanup <taskId>` | Dry-run cleanup; `--execute` closes the spawned tab then removes the worktree (`--force` forces removal) |
 | `harness gateway start` | Background localhost HTTP + chat UI (`http://127.0.0.1:8787/`) |
 | `harness gateway status` | Listening?, pid, bind, lastEvent |
 | `harness gateway stop` | Stop by pid file |
@@ -61,10 +62,12 @@ Then: `herdr server reload-config` if a server is already running.
 
 Walk up from cwd for `.herdr-harness.json`, else `examples/minimal/.herdr-harness.json`.
 
-- `adapters.routes` — grok-build, claude, anyr, codex, opencode
+- `adapters.routes` — grok-build, claude, anyr, codex, opencode. Route `kind` values that are Herdr agent kinds (e.g. `grok`, `claude`, `codex`, `opencode`) spawn via `herdr agent start --kind`; anything else (e.g. `anyr`) runs as a shell command in the new pane via `herdr pane run` (`kind` + `via` + `--model`/`flags`).
 - `tasks` — id + adapter + optional worktree stub
 - `soul` — [`templates/soul.md`](./templates/soul.md)
 - `playbooks` — includes `desk:sentry-issues` (Sentry/Bugsink → mock GH issues)
+
+Executed spawns persist minimal metadata (taskId → worktree path, workspace/tab/pane ids, agent name) in `~/.local/state/herdr-harness/spawns.json` for cleanup/replace. A task with a recorded spawn refuses a second `--execute`; pass `--replace` (cleanup then respawn) or `harness manager cleanup <taskId> --execute` first.
 
 ## Mock issues + pick/summary (on-demand)
 
@@ -166,4 +169,4 @@ bun run test
 
 ## Not in this MVP
 
-Fleet metrics, release-please, full child-agent spawn, live Matrix/Telegram, GitHub issue create, cron.
+Fleet metrics, release-please, live Matrix/Telegram, GitHub issue create, cron.

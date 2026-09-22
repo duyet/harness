@@ -29,7 +29,11 @@ import {
   resolveTask,
   printJson,
   gatewayBind,
+  loadSpawns,
+  saveSpawn,
+  deleteSpawn,
   type State,
+  type SpawnRecord,
 } from "./shared.ts";
 import { lastIngress } from "./gateway.ts";
 import { ingestErrorEvent, listIssueDrafts } from "./issues.ts";
@@ -228,10 +232,16 @@ function cmdManager() {
   if (sub === "status") return cmdManagerStatus();
   if (sub === "route") return cmdManagerRoute();
   if (sub === "spawn") return cmdManagerSpawn();
+  if (sub === "cleanup") return cmdManagerCleanup();
   printJson({
     ok: false,
     error: sub ? `unknown manager subcommand: ${sub}` : "missing manager subcommand",
-    usage: ["harness manager status", "harness manager route <taskId>", "harness manager spawn <taskId> [--execute]"],
+    usage: [
+      "harness manager status",
+      "harness manager route <taskId>",
+      "harness manager spawn <taskId> [--execute] [--replace] [--cleanup]",
+      "harness manager cleanup <taskId> [--execute] [--force]",
+    ],
   });
   process.exit(1);
 }
@@ -260,9 +270,53 @@ function cmdManagerRoute() {
   printJson({ ok: true, ...resolved });
 }
 
-function intendedForTask(resolved: ReturnType<typeof resolveTask>) {
+// `herdr agent start --kind` values supported by the installed Herdr CLI.
+const HERDR_AGENT_KINDS = new Set([
+  "pi", "claude", "codex", "gemini", "cursor", "devin", "agy", "cline", "omp",
+  "mastracode", "opencode", "copilot", "kimi", "kiro", "droid", "amp", "grok",
+  "hermes", "kilo", "qodercli", "qwen", "maki",
+]);
+
+function taskLabel(taskId: string) {
+  return `harness:${taskId}`;
+}
+
+type ResolvedTask = ReturnType<typeof resolveTask>;
+
+// How the task's adapter is launched inside the new pane: a managed
+// `herdr agent start --kind` when the route maps to a supported kind, else a
+// shell command through `herdr pane run` (e.g. `anyr claude` via its kind+via).
+function agentSpec(resolved: ResolvedTask) {
+  const route = resolved.route ?? null;
+  const kind = route?.kind ?? resolved.adapterId;
+  const args = [
+    ...(route?.model ? ["--model", route.model] : []),
+    ...(route?.flags ?? []),
+  ];
+  const name = taskLabel(resolved.task!.id);
+  if (kind && HERDR_AGENT_KINDS.has(kind)) {
+    return { name, launch: "agent-start" as const, kind, args };
+  }
+  const command = [
+    kind ?? resolved.adapterId ?? "agent",
+    ...(route?.via ? [route.via] : []),
+    ...args,
+  ];
+  return { name, launch: "shell" as const, kind: kind ?? null, command };
+}
+
+type SpawnCtx = { workspaceId?: string; worktreePath?: string; paneId?: string };
+
+// Full planned spawn sequence. In dry-run, ids that only exist after a step
+// runs are shown as <placeholders>; execute re-renders each step with the ids
+// parsed from the previous step's JSON result.
+function intendedSpawnCommands(resolved: ResolvedTask, ctx: SpawnCtx = {}) {
   if (resolved.error || !resolved.task) return [];
   const wt = resolved.task.worktree ?? {};
+  const label = taskLabel(resolved.task.id);
+  const ws = ctx.workspaceId ?? "<workspace-id>";
+  const wtPath = ctx.worktreePath ?? wt.path ?? "<worktree-path>";
+  const pane = ctx.paneId ?? "<pane-id>";
   const cmds: string[][] = [
     [
       "herdr",
@@ -273,20 +327,176 @@ function intendedForTask(resolved: ReturnType<typeof resolveTask>) {
       ...(wt.branch ? ["--branch", wt.branch] : []),
       ...(wt.base ? ["--base", wt.base] : []),
       ...(wt.path ? ["--path", wt.path] : []),
-      ...(wt.label ? ["--label", wt.label] : ["--label", `harness:${resolved.task.id}`]),
+      "--label",
+      wt.label ?? label,
+      "--no-focus",
+    ],
+    [
+      "herdr",
+      "tab",
+      "create",
+      "--workspace",
+      ws,
+      "--cwd",
+      wtPath,
+      "--label",
+      label,
       "--no-focus",
     ],
   ];
+  const spec = agentSpec(resolved);
+  cmds.push(
+    spec.launch === "agent-start"
+      ? [
+          "herdr",
+          "agent",
+          "start",
+          spec.name,
+          "--kind",
+          spec.kind!,
+          "--pane",
+          pane,
+          ...(spec.args.length ? ["--", ...spec.args] : []),
+        ]
+      : ["herdr", "pane", "run", pane, ...spec.command],
+  );
   return cmds;
+}
+
+// Cleanup plan: discover live tab/worktree state, then close the child tab
+// (which stops its pane/agent) and remove the spawned worktree last.
+function intendedCleanupCommands(
+  record: SpawnRecord | undefined,
+  force: boolean,
+) {
+  return [
+    ["herdr", "tab", "list"],
+    ["herdr", "worktree", "list", "--cwd", process.cwd()],
+    ["herdr", "tab", "close", record?.tabId ?? "<tab-id>"],
+    [
+      "herdr",
+      "worktree",
+      "remove",
+      "--workspace",
+      record?.workspaceId ?? "<workspace-id>",
+      ...(force ? ["--force"] : []),
+    ],
+  ];
+}
+
+type HerdrStep = {
+  command: string[];
+  status: number | null;
+  stdout: string;
+  stderr: string;
+};
+
+function runHerdr(herdrBin: string, args: string[]): HerdrStep {
+  const r = spawnSync(herdrBin, args, { encoding: "utf8" });
+  return {
+    command: [herdrBin, ...args],
+    status: r.status,
+    stdout: (r.stdout || "").trim(),
+    stderr: (r.stderr || "").trim(),
+  };
+}
+
+// Herdr CLI prints a single {"id":...,"result":{...}} JSON envelope on stdout.
+function herdrResult(step: HerdrStep): Record<string, any> | null {
+  for (const text of [step.stdout, step.stdout.split("\n").pop() ?? ""]) {
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed && typeof parsed === "object") return parsed.result ?? parsed;
+    } catch {
+      /* try next candidate */
+    }
+  }
+  return null;
+}
+
+// Ordered cleanup: list → close matching tab(s) → remove the worktree's
+// workspace. Presence comes from live discovery; the persisted spawn record
+// only supplies extra match hints and a fallback workspace id.
+function executeCleanup(
+  taskId: string,
+  resolved: ResolvedTask | null,
+  record: SpawnRecord | undefined,
+  herdr: { bin: string },
+  force: boolean,
+) {
+  const label = taskLabel(taskId);
+  const wt = resolved?.task?.worktree ?? {};
+  const wtLabel = wt.label ?? label;
+  const results: HerdrStep[] = [];
+
+  const tabsStep = runHerdr(herdr.bin, ["tab", "list"]);
+  results.push(tabsStep);
+  const wtStep = runHerdr(herdr.bin, ["worktree", "list", "--cwd", process.cwd()]);
+  results.push(wtStep);
+  if (tabsStep.status !== 0 || wtStep.status !== 0) {
+    return { ok: false, error: "herdr discovery failed; not safe to clean up", results };
+  }
+  const tabs = herdrResult(tabsStep)?.tabs;
+  const worktrees = herdrResult(wtStep)?.worktrees;
+  if (!Array.isArray(tabs) || !Array.isArray(worktrees)) {
+    return { ok: false, error: "could not parse herdr list output", results };
+  }
+
+  const tabIds = tabs
+    .filter((t: any) => t?.tab_id === record?.tabId || t?.label === label)
+    .map((t: any) => t.tab_id)
+    .filter((id: any) => typeof id === "string");
+  const wtMatch = worktrees.find(
+    (w: any) =>
+      w?.open_workspace_id === record?.workspaceId ||
+      w?.path === record?.worktreePath ||
+      (wt.path && w?.path === wt.path) ||
+      w?.label === wtLabel,
+  );
+  const workspaceId = wtMatch?.open_workspace_id ?? record?.workspaceId ?? null;
+
+  const closedTabs: string[] = [];
+  for (const tabId of tabIds) {
+    const r = runHerdr(herdr.bin, ["tab", "close", tabId]);
+    results.push(r);
+    if (r.status === 0) closedTabs.push(tabId);
+  }
+  let removedWorkspace: string | null = null;
+  if (workspaceId) {
+    const r = runHerdr(herdr.bin, [
+      "worktree",
+      "remove",
+      "--workspace",
+      workspaceId,
+      ...(force ? ["--force"] : []),
+    ]);
+    results.push(r);
+    if (r.status === 0) removedWorkspace = workspaceId;
+  }
+
+  const ok = results.every((r) => r.status === 0);
+  if (ok) deleteSpawn(taskId);
+  return {
+    ok,
+    results,
+    found: { tabs: tabIds, worktrees: worktrees.length, workspaceId },
+    closedTabs,
+    removedWorkspace,
+    cleaned: tabIds.length > 0 || removedWorkspace != null,
+  };
 }
 
 function cmdManagerSpawn() {
   const f = argvFlags(4);
   const execute = f.has("--execute");
+  const replace = f.has("--replace");
+  const force = f.has("--force");
   const taskId = positional(4)[0];
+  if (f.has("--cleanup")) return cmdManagerCleanup();
   const resolved = resolveTask(taskId);
-  const intendedCommands = intendedForTask(resolved);
+  const intendedCommands = intendedSpawnCommands(resolved);
   const herdr = herdrUsable();
+  const record = taskId ? loadSpawns().spawns[taskId] : undefined;
 
   if (resolved.error) {
     printJson({
@@ -311,35 +521,167 @@ function cmdManagerSpawn() {
       intendedCommands,
       herdr,
       skippedExecute: why,
+      ...(record ? { existingSpawn: record } : {}),
+      ...(replace
+        ? {
+            replace: true,
+            cleanup: {
+              intendedCommands: intendedCleanupCommands(record, force),
+            },
+          }
+        : {}),
       todo: [
         "Pass --execute when a live Herdr socket is available",
-        "Child agent spawn / tab create is not wired yet",
+        ...(record
+          ? [`existing spawn recorded for ${taskId}; pass --replace to respawn or --cleanup to remove`]
+          : []),
       ],
     });
     return;
   }
 
-  const results = [];
-  for (const cmd of intendedCommands) {
-    const [bin, ...args] = cmd[0] === "herdr" ? [herdr.bin, ...cmd.slice(1)] : cmd;
-    const r = spawnSync(bin, args, { encoding: "utf8" });
-    results.push({
-      command: [bin, ...args],
-      status: r.status,
-      stdout: (r.stdout || "").trim(),
-      stderr: (r.stderr || "").trim(),
+  if (record && !replace) {
+    printJson({
+      ok: false,
+      mode: "executed",
+      ...resolved,
+      error: `task already spawned: ${taskId}`,
+      spawn: record,
+      hint: "pass --replace to clean up and respawn, or --cleanup / `harness manager cleanup` to remove",
+    });
+    process.exit(1);
+  }
+
+  let cleanup: ReturnType<typeof executeCleanup> | null = null;
+  if (replace) {
+    cleanup = executeCleanup(taskId!, resolved, record, herdr, force);
+    if (!cleanup.ok) {
+      printJson({
+        ok: false,
+        mode: "executed",
+        replace: true,
+        ...resolved,
+        error: "cleanup before re-spawn failed",
+        cleanup,
+        hint: "inspect cleanup.results; retry with --force or `harness manager cleanup`",
+      });
+      process.exit(1);
+    }
+  }
+
+  const results: HerdrStep[] = [];
+  const ctx: SpawnCtx = {};
+  const spec = agentSpec(resolved);
+  const spawn: SpawnRecord = {
+    taskId: taskId!,
+    adapterId: resolved.adapterId ?? undefined,
+    cwd: process.cwd(),
+    at: new Date().toISOString(),
+  };
+  const finish = (ok: boolean, extra: Record<string, unknown> = {}) => {
+    printJson({
+      ok,
+      mode: "executed",
+      ...(replace ? { replace: true, cleanup } : {}),
+      ...resolved,
+      intendedCommands,
+      results,
+      spawn,
+      ...extra,
+    });
+    if (!ok) process.exit(1);
+  };
+
+  const argvFor = (i: number) => intendedSpawnCommands(resolved, ctx)[i].slice(1);
+
+  const wtStep = runHerdr(herdr.bin, argvFor(0));
+  results.push(wtStep);
+  if (wtStep.status !== 0) {
+    return finish(false, {
+      error: "herdr worktree create failed",
+      hint: "if a worktree/tab already exists for this task, re-run with --replace or `harness manager cleanup <taskId>` first",
     });
   }
-  const ok = results.every((r) => r.status === 0);
+  const wtResult = herdrResult(wtStep);
+  ctx.workspaceId = wtResult?.workspace?.workspace_id;
+  ctx.worktreePath = wtResult?.worktree?.path ?? resolved.task?.worktree?.path;
+  if (ctx.workspaceId) spawn.workspaceId = ctx.workspaceId;
+  if (ctx.worktreePath) spawn.worktreePath = ctx.worktreePath;
+  if (wtResult?.tab?.tab_id) spawn.tabId = wtResult.tab.tab_id;
+  saveSpawn(spawn);
+  if (!ctx.workspaceId || !ctx.worktreePath) {
+    return finish(false, {
+      error: "could not parse worktree/workspace ids from herdr worktree create output",
+    });
+  }
+
+  const tabStep = runHerdr(herdr.bin, argvFor(1));
+  results.push(tabStep);
+  if (tabStep.status !== 0) {
+    return finish(false, { error: "herdr tab create failed" });
+  }
+  const tabResult = herdrResult(tabStep);
+  ctx.paneId = tabResult?.root_pane?.pane_id;
+  if (tabResult?.tab?.tab_id) spawn.tabId = tabResult.tab.tab_id;
+  if (ctx.paneId) spawn.paneId = ctx.paneId;
+  saveSpawn(spawn);
+  if (!ctx.paneId) {
+    return finish(false, {
+      error: "could not parse pane id from herdr tab create output",
+    });
+  }
+
+  const agentStep = runHerdr(herdr.bin, argvFor(2));
+  results.push(agentStep);
+  spawn.agentName = spec.name;
+  saveSpawn(spawn);
+  if (agentStep.status !== 0) {
+    return finish(false, { error: "herdr agent start failed" });
+  }
+  finish(true, { agent: spec });
+}
+
+function cmdManagerCleanup() {
+  const f = argvFlags(4);
+  const execute = f.has("--execute");
+  const force = f.has("--force");
+  const taskId = positional(4)[0];
+  if (!taskId) {
+    printJson({ ok: false, error: "missing taskId", usage: ["harness manager cleanup <taskId> [--execute] [--force]"] });
+    process.exit(1);
+  }
+  const resolved = resolveTask(taskId);
+  const herdr = herdrUsable();
+  const record = loadSpawns().spawns[taskId];
+  const cleanupPlan = intendedCleanupCommands(record, force);
+
+  if (!execute || !herdr.ok) {
+    const why = !execute
+      ? "default is dry-run; pass --execute to run cleanup"
+      : herdr.reason;
+    printJson({
+      ok: true,
+      mode: "dry-run",
+      taskId,
+      ...(resolved.error ? { configError: resolved.error } : { task: resolved.task }),
+      previousSpawn: record ?? null,
+      cleanup: { intendedCommands: cleanupPlan },
+      herdr,
+      skippedExecute: why,
+    });
+    return;
+  }
+
+  const cleanup = executeCleanup(taskId, resolved.error ? null : resolved, record, herdr, force);
   printJson({
-    ok,
+    ok: cleanup.ok,
     mode: "executed",
-    ...resolved,
-    intendedCommands,
-    results,
-    todo: ["tab/agent create after worktree is still a stub"],
+    taskId,
+    ...(resolved.error ? {} : { task: resolved.task }),
+    previousSpawn: record ?? null,
+    cleanup,
   });
-  if (!ok) process.exitCode = 1;
+  if (!cleanup.ok) process.exit(1);
 }
 
 function pidAlive(pid: number): boolean {
@@ -700,7 +1042,8 @@ Usage:
   harness resume                        Restore last session from state
   harness manager status                List adapters, routes, tasks
   harness manager route <taskId>        Resolve task → adapter
-  harness manager spawn <taskId>        Dry-run worktree spawn (--execute to try herdr)
+  harness manager spawn <taskId>        Dry-run worktree+tab+agent spawn (--execute, --replace, --cleanup)
+  harness manager cleanup <taskId>      Close spawned tab + remove worktree (--execute, --force)
   harness gateway start [--foreground]  Local HTTP ingress (default 127.0.0.1:8787)
   harness gateway status                Pid, bind, lastEvent
   harness gateway stop                  Stop background gateway

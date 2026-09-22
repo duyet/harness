@@ -37,6 +37,7 @@ Run **001 first**. 002–005 are independent of each other after 001 and may be 
 | 003 | Preserve the caller's repository context in the background gateway | DONE | 001 |
 | 004 | Return predictable JSON errors for invalid gateway requests | DONE | 001 |
 | 005 | Make executed manager failures return a nonzero CLI status | DONE | 001 |
+| 006 | Wire manager spawn child tab/agent and cleanup UX | DONE | 001, 005 |
 
 ## Considered and rejected / deferred
 
