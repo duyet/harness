@@ -86,7 +86,7 @@ Gateway (restart after upgrade so new routes load): `POST /ingress/sentry` and `
 
 **Pick order:** mock issue drafts, then config `tasks` in list order (rotates after last pick), then freeform ingress. **Summary is CLI-only — no scheduler.**
 
-## Gateway / chat ingress (stub)
+## Gateway / chat ingress (stub, opt-in execute)
 
 Local HTTP only. **Never talks to real Matrix or Telegram APIs.** Tokens are unused placeholders.
 
@@ -110,14 +110,18 @@ harness gateway stop
 
 Ingress returns **202** and runs manager route in-process (no herdr spawn). Queue/last event: `~/.local/state/herdr-harness/last-ingress.json`.
 
+`POST /chat` replies are stubs by default (`mode: "stub"` — no subprocess, no LLM). Opt in per request with `"execute": true` or globally with `HARNESS_CHAT_EXECUTE=1`: the gateway spawns the resolved route's CLI locally — route `kind` as the binary, then `via`/`--model`/`flags`, plus best-effort non-interactive args for known kinds (`claude -p`, `codex exec`, `gemini -p`, `grok -p`, `opencode run`) — with the chat text as the final argument and a hard timeout (default 10s, `HARNESS_CHAT_TIMEOUT_MS`, clamped 100–60000). On a clean exit 0 the reply is the adapter's stdout with `mode: "executed"`; on any failure (missing binary, non-zero exit, timeout) the response is still **200** `ok:true` with `mode: "stub"`, the stub `reply`, and an `executeError` field — `/chat` never hangs or 500s on adapter problems. Responses also carry top-level `adapterId` and an `execute` detail object (`command`, `status`, `timedOut`, `durationMs`) when an invoke was attempted. Matrix/Telegram ingress stays stub-only.
+
 All five POST routes (`/chat` and `/ingress/matrix`, `/ingress/telegram`, `/ingress/sentry`, `/ingress/bugsink`) return **400** with `{ "ok": false, "error": "..." }` for invalid input: `invalid JSON` for malformed JSON or an empty body; `expected JSON object` for top-level null, arrays or scalars; `invalid payload shape` for non-object Matrix `content` or Telegram `message`, `chat` or `from` containers. Optional containers may be absent or null; Telegram checks `chat` and `from` on the selected message (nested `message`, or the top-level fallback). Empty objects and extra fields remain accepted; this is not full provider-schema validation. Rejected input does not write state. Success statuses remain **200** for `/chat` and **202** for the four ingress routes; GET and unknown-route behavior is unchanged.
 
-### Env (stub)
+### Env
 
 | Var | Used now | Later |
 | --- | --- | --- |
 | `HARNESS_GATEWAY_HOST` | bind host (default `127.0.0.1`) | |
 | `HARNESS_GATEWAY_PORT` | bind port (default `8787`) | |
+| `HARNESS_CHAT_EXECUTE` | `1`/`true`/`yes`/`on` makes `/chat` run the adapter CLI | |
+| `HARNESS_CHAT_TIMEOUT_MS` | `/chat` adapter timeout (default `10000`, clamped 100–60000) | |
 | `HARNESS_MATRIX_TOKEN` | unused | Matrix client |
 | `HARNESS_MATRIX_HOMESERVER` | unused | Matrix client |
 | `HARNESS_TELEGRAM_BOT_TOKEN` | unused | Telegram bot |

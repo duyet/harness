@@ -12,6 +12,12 @@ import {
   gatewayBind,
 } from "./shared.ts";
 import { ingestErrorEvent } from "./issues.ts";
+import {
+  chatAdapterArgv,
+  chatExecuteEnabled,
+  chatTimeoutMs,
+  invokeAdapter,
+} from "./chat.ts";
 
 const CHAT_HTML = join(ROOT, "src", "static", "chat.html");
 
@@ -155,6 +161,47 @@ function stubReply(result: ReturnType<typeof handleIngress>): string {
   return `stub: routed task ${t.id} → adapter ${t.adapterId} (${kind}). No LLM.`;
 }
 
+// /chat replies: stub by default; with `"execute": true` in the body or
+// HARNESS_CHAT_EXECUTE=1 the resolved adapter CLI runs as a short bounded
+// subprocess. Any invoke failure still returns ok:true with mode:"stub" and
+// an executeError field — the chat endpoint never hangs or 500s on adapters.
+async function chatReply(
+  result: ReturnType<typeof handleIngress>,
+  raw: Record<string, unknown>,
+) {
+  const adapterId = result.task.adapterId;
+  if (!chatExecuteEnabled(raw)) {
+    return { mode: "stub" as const, reply: stubReply(result), adapterId };
+  }
+  const prompt =
+    result.task.text ?? (result.task.id ? `task: ${result.task.id}` : "");
+  const command = chatAdapterArgv(adapterId, result.route, prompt);
+  const timeoutMs = chatTimeoutMs();
+  const invoked = await invokeAdapter(command, timeoutMs);
+  const execute = {
+    command,
+    timeoutMs,
+    status: invoked.status,
+    timedOut: invoked.timedOut,
+    durationMs: invoked.durationMs,
+  };
+  if (invoked.ok) {
+    return {
+      mode: "executed" as const,
+      reply: invoked.stdout || "(adapter exited 0 with no output)",
+      adapterId,
+      execute,
+    };
+  }
+  return {
+    mode: "stub" as const,
+    reply: stubReply(result),
+    adapterId,
+    executeError: invoked.error ?? "adapter invoke failed",
+    execute,
+  };
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -221,9 +268,10 @@ export async function handleGatewayRequest(req: Request, bind: ReturnType<typeof
     const parsed = await parseJsonObject(req);
     if (!parsed.ok) return parsed.response;
     const result = handleIngress("chat", parsed.body);
+    const reply = await chatReply(result, parsed.body);
     return Response.json({
       ok: true,
-      reply: stubReply(result),
+      ...reply,
       task: result.task,
       route: result.route,
       lastEvent: result.lastEvent,
