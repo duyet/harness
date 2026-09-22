@@ -24,6 +24,8 @@ import {
   LAST_DELIVERY_FILE,
   VERSION,
   RESTART_RESUME_HINT,
+  CTRL_G_ACTION,
+  CTRL_G_EXAMPLE_CONFIG,
   PLAYBOOK_SENTRY,
   loadState,
   saveState,
@@ -128,6 +130,11 @@ function cmdStatus() {
     configPath,
     root: ROOT,
     stateFile: STATE_FILE,
+    ctrlGHint: {
+      action: CTRL_G_ACTION,
+      exampleConfig: CTRL_G_EXAMPLE_CONFIG,
+      note: "plugins cannot declare keybindings; copy the example into ~/.config/herdr/config.toml",
+    },
   };
   if (process.argv.includes("--json") || !process.stdout.isTTY) {
     printJson(json);
@@ -182,6 +189,7 @@ function cmdUpgrade() {
   if (!needs) {
     console.log("already up to date");
     console.log(RESTART_RESUME_HINT);
+    console.log(`ctrl+g snippet:   ${CTRL_G_EXAMPLE_CONFIG}`);
     return;
   }
 
@@ -198,6 +206,7 @@ function cmdUpgrade() {
   }
   console.log(`recorded version ${checkoutVersion}`);
   console.log(RESTART_RESUME_HINT);
+  console.log(`ctrl+g snippet:   ${CTRL_G_EXAMPLE_CONFIG}`);
 }
 
 function cmdResume() {

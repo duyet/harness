@@ -4,19 +4,27 @@ Persistent local agent harness. Separate from [herdr-desk](https://github.com/du
 
 Plugin id: `harness` · version from `package.json` (0.0.6)
 
-## Local install / link
+## Install / upgrade
 
 ```bash
 chmod +x bin/harness
-harness upgrade
+harness upgrade                          # links ~/.local/bin/harness -> this checkout
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Herdr plugin (required for Ctrl+G `plugin_action`):
+Herdr plugin link (required for the Ctrl+G `plugin_action`):
 
 ```bash
-herdr --session harness plugin link /workspace/harness
-herdr --session harness plugin action list --plugin harness
+herdr --session harness plugin link /path/to/harness
+```
+
+### Verify
+
+```bash
+harness upgrade                                             # "already up to date" once linked
+harness status --json                                       # ok:true + ctrlGHint
+herdr --session harness plugin action list --plugin harness # shows "resume" (=> harness.resume)
+cat examples/herdr-config-ctrl-g.toml                       # the Ctrl+G snippet to copy
 ```
 
 ## Commands
@@ -25,7 +33,7 @@ herdr --session harness plugin action list --plugin harness
 | --- | --- |
 | `harness start` | New session id |
 | `harness start --resume` | Keep last session id |
-| `harness status [--json]` | Status; JSON includes adapters + tasks |
+| `harness status [--json]` | Status; JSON includes adapters + tasks + `ctrlGHint` |
 | `harness resume` | Restore last session (CLI path; non-zero if none) |
 | `harness upgrade` | Local relink of `~/.local/bin/harness` |
 | `harness manager status` | Adapters, routes, tasks from `.herdr-harness.json` |
@@ -57,6 +65,18 @@ Snippet: [`examples/herdr-config-ctrl-g.toml`](./examples/herdr-config-ctrl-g.to
 Primary path is still `harness resume`. After an in-place upgrade, a running agent still has the old process in memory: **Press Ctrl+G in the agent to restart and resume.**
 
 Then: `herdr server reload-config` if a server is already running.
+
+### Manual verification (TUI — not automated)
+
+The real keybind fires inside the Herdr TUI, which this repo cannot drive. Check by hand:
+
+1. `herdr --session harness plugin action list --plugin harness` lists `resume`.
+2. `~/.config/herdr/config.toml` contains the snippet above (copy of [`examples/herdr-config-ctrl-g.toml`](./examples/herdr-config-ctrl-g.toml)).
+3. `herdr server reload-config` (or restart the server) so the keybind loads.
+4. Focus an agent tab and press **Ctrl+G** — the harness session restarts and resumes.
+5. `harness status --json` still shows `ok: true` with the resumed `sessionId`.
+
+`harness status --json` echoes a `ctrlGHint` (`action`, `exampleConfig`) for scripted checks; `harness upgrade` prints the snippet path too.
 
 ## Per-repo config
 
@@ -177,9 +197,15 @@ bun run test
 ```
 
 - `tests/baseline.test.ts` covers session persistence, routing, issue normalization and pick rotation through `src/cli.ts`.
+- `tests/ctrl-g.test.ts` pins the Ctrl+G example snippet, the `harness.resume` plugin action id, and the `ctrlGHint` fields in `status --json`/`upgrade`.
 - Each test runs the CLI in an isolated subprocess fixture under `dist/.test-tmp/` (own `HOME`, cwd and `TMPDIR`); nothing touches the real home or state directories.
 - There are no lint or typecheck gates in this repo, and `bun test` does not typecheck.
 
 ## Not in this MVP
 
-Fleet metrics, release-please, live Matrix/Telegram, cron. Real GitHub issue create is opt-in only (`issues ingest --execute`); the gateway never calls GitHub.
+Fleet metrics, live Matrix/Telegram, cron. Real GitHub issue create is opt-in only (`issues ingest --execute`); the gateway never calls GitHub.
+
+Explicitly deferred ([issue #1](https://github.com/duyet/harness/issues/1)):
+
+- **release-please / release automation** — no RP config in this repo; revisit once a release story is approved.
+- **Automated Ctrl+G verification** — the keybind runs inside the Herdr TUI; use the manual checklist above.

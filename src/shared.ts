@@ -21,6 +21,16 @@ export const PLAYBOOK_SENTRY = "desk:sentry-issues";
 export const RESTART_RESUME_HINT =
   "Press Ctrl+G in the agent to restart and resume.";
 
+// Ctrl+G is a user-level keybinding (plugins cannot declare keys). The plugin
+// action id is <plugin>.<action> = harness.resume; the example snippet lives
+// in the repo so `harness status --json` can point at it.
+export const CTRL_G_ACTION = "harness.resume";
+export const CTRL_G_EXAMPLE_CONFIG = join(
+  ROOT,
+  "examples",
+  "herdr-config-ctrl-g.toml",
+);
+
 export type State = {
   started: boolean;
   startedAt?: string;
