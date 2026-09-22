@@ -33,12 +33,12 @@ herdr --session harness plugin action list --plugin harness
 | `harness manager spawn <taskId>` | Dry-run `herdr worktree create` + `tab create` + agent start unless `--execute` and Herdr is usable; `--replace` cleans up first, `--cleanup` only cleans up |
 | `harness manager cleanup <taskId>` | Dry-run cleanup; `--execute` closes the spawned tab then removes the worktree (`--force` forces removal) |
 | `harness gateway start` | Background localhost HTTP + chat UI (`http://127.0.0.1:8787/`) |
-| `harness gateway status` | Listening?, pid, bind, lastEvent |
+| `harness gateway status` | Listening?, pid, bind, lastEvent, lastDelivery |
 | `harness gateway stop` | Stop by pid file |
 | `harness issues ingest --source sentry\|bugsink` | Mock GH issue draft from JSON stdin/`--file` (no GitHub API); `--execute` also runs a real `gh issue create` |
 | `harness issues list` | Drafts under `~/.local/state/herdr-harness/issues/` |
-| `harness pick` | Next work: mock issues → named tasks (list order) → freeform queue |
-| `harness summary` | On-demand markdown report (`--json` ok). **No cron.** |
+| `harness pick` | Next work: mock issue drafts (severity-ordered) → named tasks → freeform queue |
+| `harness summary` | On-demand markdown report (`--json` ok). **No cron.** `--deliver`/`--write` also writes `last-summary.md`/`.json` + `last-delivery.json` under the state dir |
 
 ## Ctrl+G (user config, not the plugin)
 
@@ -84,7 +84,16 @@ harness summary
 
 Gateway (restart after upgrade so new routes load): `POST /ingress/sentry` and `POST /ingress/bugsink`.
 
-**Pick order:** mock issue drafts, then config `tasks` in list order (rotates after last pick), then freeform ingress. **Summary is CLI-only — no scheduler.**
+**Pick rules** (also exposed as `rules` in `harness pick --json`):
+
+1. Issue drafts first, then config `tasks`, then freeform ingress.
+2. Within issues: only `status: "mock-draft"` is pickable work — `github-created` drafts are never re-picked (if only created drafts remain, the issue tier is skipped entirely).
+3. Higher severity `level` (from labels or `raw.level`) wins: `fatal > error > warning > info > other`.
+4. Newer `createdAt` breaks severity ties.
+5. Within tasks: rotate by list order after `lastPicked`; on a cold start (no prior task pick), tasks with a `worktree` stub are preferred before tasks without.
+6. Freeform: the most recent freeform ingress event wins.
+
+**Summary is CLI-only — no scheduler.** `harness summary --deliver` (alias `--write`) is the human-delivery stub: it writes the report to `~/.local/state/herdr-harness/last-summary.md` plus a `last-summary.json` sidecar, and records a `lastDelivery` blob in `last-delivery.json` that `harness gateway status --json`, `GET /status` and `harness summary` surface. Stub-mode `POST /chat` replies pick the last summary up when asked — body `"pickup": true`, a `?pickup=true` query flag, or the literal text `/summary` — by appending its excerpt and returning it as `lastSummary` (`null` when nothing was delivered). Executed `/chat` replies are never amended.
 
 ## Gateway / chat ingress (stub, opt-in execute)
 

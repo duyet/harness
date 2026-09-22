@@ -19,6 +19,9 @@ import {
   GATEWAY_PID_FILE,
   GATEWAY_META_FILE,
   INGRESS_QUEUE_FILE,
+  LAST_SUMMARY_FILE,
+  LAST_SUMMARY_JSON_FILE,
+  LAST_DELIVERY_FILE,
   VERSION,
   RESTART_RESUME_HINT,
   PLAYBOOK_SENTRY,
@@ -32,13 +35,17 @@ import {
   loadSpawns,
   saveSpawn,
   deleteSpawn,
+  lastDelivery,
   type State,
   type SpawnRecord,
+  type LastDelivery,
 } from "./shared.ts";
 import { lastIngress } from "./gateway.ts";
 import {
   ingestErrorEvent,
   listIssueDrafts,
+  rankIssueDrafts,
+  issueSeverity,
   ghIssueCreateArgv,
   publishIssueDraft,
 } from "./issues.ts";
@@ -704,7 +711,7 @@ function readPid(): number | null {
   return Number.isFinite(n) && n > 0 ? n : null;
 }
 
-function gatewayListening(): { pid: number | null; bind: ReturnType<typeof gatewayBind>; alive: boolean; lastEvent: unknown } {
+function gatewayListening(): { pid: number | null; bind: ReturnType<typeof gatewayBind>; alive: boolean; lastEvent: unknown; lastDelivery: LastDelivery | null } {
   const pid = readPid();
   const alive = pid != null && pidAlive(pid);
   let bind = gatewayBind();
@@ -716,7 +723,7 @@ function gatewayListening(): { pid: number | null; bind: ReturnType<typeof gatew
       /* ignore */
     }
   }
-  return { pid, bind, alive, lastEvent: lastIngress() };
+  return { pid, bind, alive, lastEvent: lastIngress(), lastDelivery: lastDelivery() };
 }
 
 async function waitHealth(bind: { hostname: string; port: number }, timeoutMs = 4000) {
@@ -745,6 +752,7 @@ async function cmdGatewayStart() {
       pid: current.pid,
       bind: current.bind,
       lastEvent: current.lastEvent,
+      lastDelivery: current.lastDelivery,
     });
     return;
   }
@@ -788,6 +796,7 @@ function cmdGatewayStatus() {
     pid: g.pid,
     bind: g.bind,
     lastEvent: g.lastEvent,
+    lastDelivery: g.lastDelivery,
     version: VERSION,
   });
 }
@@ -908,10 +917,22 @@ function loadIngressQueue(): Array<{ freeform?: boolean; taskId?: string | null;
   }
 }
 
+// Ordered pick priority, also exposed as `rules` in `pick --json` output.
+const PICK_RULES = [
+  "issue drafts first, then config tasks, then freeform ingress",
+  "issues: only mock-draft is pickable work; github-created is never re-picked",
+  "issues: higher severity level first (fatal > error > warning > info > other)",
+  "issues: newer createdAt breaks severity ties",
+  "tasks: rotate by list order after lastPicked; a cold start prefers tasks with a worktree stub",
+  "freeform: most recent freeform ingress event wins",
+];
+
 function cmdPick() {
   const { config } = loadConfig();
   const defaultAdapter = config?.adapters?.default ?? config?.agent ?? "grok-build";
-  const drafts = listIssueDrafts().filter((d) => d.status === "mock-draft");
+  const drafts = rankIssueDrafts(
+    listIssueDrafts().filter((d) => d.status === "mock-draft"),
+  );
   const tasks = config?.tasks ?? [];
   const queue = loadIngressQueue();
   const prev = loadState();
@@ -922,6 +943,7 @@ function cmdPick() {
     adapter: string;
     reason: string;
     title?: string;
+    severity?: string;
   } | null = null;
 
   if (drafts.length) {
@@ -930,18 +952,29 @@ function cmdPick() {
       id: `issue:${d.fingerprint}`,
       kind: "issue",
       adapter: defaultAdapter,
-      reason: "priority: mock issues first (desk:sentry-issues)",
+      severity: issueSeverity(d),
+      reason: "priority: mock issue drafts by severity then recency (github-created drafts are skipped)",
       title: d.title,
     };
   } else if (tasks.length) {
     const lastId = prev.lastPicked?.kind === "task" ? prev.lastPicked.id : null;
     const idx = lastId ? tasks.findIndex((t) => t.id === lastId) : -1;
-    const next = tasks[(idx + 1) % tasks.length];
+    // Cold start (no matching lastPicked task): prefer the first task that
+    // declares a worktree stub, else fall back to plain list order.
+    const next =
+      idx >= 0
+        ? tasks[(idx + 1) % tasks.length]
+        : (tasks.find((t) => t.worktree) ?? tasks[0]);
     chosen = {
       id: next.id,
       kind: "task",
       adapter: next.adapter ?? defaultAdapter,
-      reason: "priority: named tasks by list order (rotate after lastPicked)",
+      reason:
+        idx >= 0
+          ? "priority: named tasks by list order (rotate after lastPicked)"
+          : next.worktree
+            ? "priority: cold-start task with a worktree stub"
+            : "priority: named tasks by list order (rotate after lastPicked)",
     };
   } else {
     const free = [...queue].reverse().find((e) => e.freeform);
@@ -958,7 +991,7 @@ function cmdPick() {
 
   if (!chosen) {
     if (process.argv.includes("--json") || !process.stdout.isTTY) {
-      printJson({ ok: false, error: "nothing to pick" });
+      printJson({ ok: false, error: "nothing to pick", rules: PICK_RULES });
     } else {
       console.error("nothing to pick");
     }
@@ -971,7 +1004,7 @@ function cmdPick() {
     lastPicked: { id: chosen.id, kind: chosen.kind, adapter: chosen.adapter, at: new Date().toISOString() },
   });
 
-  const json = { ok: true, ...chosen, rules: ["mock issues > named tasks by list order > freeform queue"] };
+  const json = { ok: true, ...chosen, rules: PICK_RULES };
   if (process.argv.includes("--json") || !process.stdout.isTTY) {
     printJson(json);
     return;
@@ -980,18 +1013,41 @@ function cmdPick() {
   console.log(chosen.reason);
 }
 
+// Human delivery stub: `harness summary --deliver` (or --write) persists the
+// report under the state dir and records a lastDelivery blob that
+// `harness gateway status` and /chat pickup can surface. No cron, no live
+// Telegram/Matrix.
+function writeSummaryDelivery(markdown: string, report: Record<string, unknown>): LastDelivery {
+  const record: LastDelivery = {
+    kind: "summary",
+    at: new Date().toISOString(),
+    summaryPath: LAST_SUMMARY_FILE,
+    summaryJsonPath: LAST_SUMMARY_JSON_FILE,
+    deliveryPath: LAST_DELIVERY_FILE,
+    bytes: Buffer.byteLength(markdown, "utf8"),
+    excerpt: markdown.slice(0, 600).trim(),
+  };
+  mkdirSync(STATE_DIR, { recursive: true });
+  writeFileSync(LAST_SUMMARY_FILE, markdown.endsWith("\n") ? markdown : `${markdown}\n`);
+  writeFileSync(LAST_SUMMARY_JSON_FILE, `${JSON.stringify(report, null, 2)}\n`);
+  writeFileSync(LAST_DELIVERY_FILE, `${JSON.stringify(record, null, 2)}\n`);
+  return record;
+}
+
 function cmdSummary() {
   const state = loadState();
   const { path: configPath, config } = loadConfig();
   const drafts = listIssueDrafts();
   const last = lastIngress();
+  const storedDelivery = lastDelivery();
   const gPid = existsSync(GATEWAY_PID_FILE)
     ? Number(readFileSync(GATEWAY_PID_FILE, "utf8").trim())
     : null;
-  const json = {
+  const generatedAt = new Date().toISOString();
+  const json: Record<string, unknown> = {
     ok: true,
     version: VERSION,
-    generatedAt: new Date().toISOString(),
+    generatedAt,
     session: {
       started: state.started,
       startedAt: state.startedAt ?? null,
@@ -1003,24 +1059,22 @@ function cmdSummary() {
     tasks: config?.tasks ?? [],
     gatewayLastEvent: last,
     gatewayPid: gPid,
+    lastDelivery: storedDelivery,
     issueDrafts: drafts.map((d) => ({
       fingerprint: d.fingerprint,
       title: d.title,
       source: d.source,
+      status: d.status,
+      severity: issueSeverity(d),
       createdAt: d.createdAt,
       path: d.path,
     })),
   };
 
-  if (process.argv.includes("--json")) {
-    printJson(json);
-    return;
-  }
-
   const lines = [
     `# harness daily summary (on-demand)`,
     ``,
-    `Generated: ${json.generatedAt}`,
+    `Generated: ${generatedAt}`,
     `Version: ${VERSION}`,
     ``,
     `## Session`,
@@ -1043,10 +1097,35 @@ function cmdSummary() {
       ? `- ${last.at} ${last.source} taskId=${last.taskId} freeform=${last.freeform}`
       : `- none`,
     ``,
+    `## Last delivery`,
+    storedDelivery
+      ? `- ${storedDelivery.at} → ${storedDelivery.summaryPath}`
+      : `- none`,
+    ``,
     `No cron. Run \`harness summary\` when you want a report.`,
     ``,
   ];
-  console.log(lines.join("\n"));
+  const markdown = `${lines.join("\n")}\n`;
+
+  const deliver = argvFlags().has("--deliver") || argvFlags().has("--write");
+  if (deliver) {
+    // The report body describes state at generation time; the new delivery
+    // record becomes the stored lastDelivery from here on.
+    const record = writeSummaryDelivery(markdown, json);
+    json.lastDelivery = record;
+    json.delivered = {
+      summaryPath: record.summaryPath,
+      summaryJsonPath: record.summaryJsonPath,
+      deliveryPath: record.deliveryPath,
+    };
+  }
+
+  if (process.argv.includes("--json")) {
+    printJson(json);
+    return;
+  }
+  console.log(markdown.replace(/\n$/, ""));
+  if (deliver) console.log(`delivered: ${LAST_SUMMARY_FILE}`);
 }
 
 async function cmdGateway() {
@@ -1080,8 +1159,9 @@ Usage:
   harness issues ingest --source sentry|bugsink [--file PATH] [--execute]
                                         Mock draft by default; --execute runs real gh issue create
   harness issues list                   Issue drafts (mock or github-created)
-  harness pick                          Next task: mock issues > config tasks > freeform
-  harness summary                       On-demand markdown report (no cron)
+  harness pick                          Next work: mock issues (severity) > tasks > freeform
+  harness summary [--deliver|--write]   On-demand markdown report; --deliver writes
+                                        last-summary.md/.json + last-delivery.json (no cron)
 
 Ctrl+G = restart + resume (user herdr config binds plugin_action harness.resume).
 CLI path: harness resume. Plugins cannot declare keybindings.

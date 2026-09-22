@@ -10,6 +10,7 @@ import {
   loadConfig,
   resolveTask,
   gatewayBind,
+  lastDelivery,
 } from "./shared.ts";
 import { ingestErrorEvent } from "./issues.ts";
 import {
@@ -206,6 +207,19 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+// Summary pickup is opt-in per request: body `"pickup": true` (or "1"/"true"),
+// a `?pickup=true|1` query flag, or the literal text `/summary`. Only stub
+// replies are amended, so executed adapter replies stay untouched.
+function chatPickupRequested(
+  raw: Record<string, unknown>,
+  url: URL,
+  text: string | null,
+): boolean {
+  const flag = raw.pickup === true || raw.pickup === "true" || raw.pickup === "1";
+  const query = url.searchParams.get("pickup");
+  return flag || query === "true" || query === "1" || (text ?? "").trim() === "/summary";
+}
+
 type ParsedBody =
   | { ok: true; body: Record<string, unknown> }
   | { ok: false; response: Response };
@@ -269,14 +283,24 @@ export async function handleGatewayRequest(req: Request, bind: ReturnType<typeof
     if (!parsed.ok) return parsed.response;
     const result = handleIngress("chat", parsed.body);
     const reply = await chatReply(result, parsed.body);
-    return Response.json({
+    const body: Record<string, unknown> = {
       ok: true,
       ...reply,
       task: result.task,
       route: result.route,
       lastEvent: result.lastEvent,
       queued: result.queued,
-    });
+    };
+    if (reply.mode === "stub" && chatPickupRequested(parsed.body, url, result.task.text)) {
+      const delivery = lastDelivery();
+      body.lastSummary = delivery
+        ? { at: delivery.at, path: delivery.summaryPath, excerpt: delivery.excerpt }
+        : null;
+      if (delivery) {
+        body.reply = `${reply.reply}\n\nlast summary (${delivery.at}):\n${delivery.excerpt}`;
+      }
+    }
+    return Response.json(body);
   }
   if (req.method === "GET" && url.pathname === "/status") {
     return Response.json({
@@ -285,6 +309,7 @@ export async function handleGatewayRequest(req: Request, bind: ReturnType<typeof
       version: VERSION,
       bind,
       lastEvent: lastIngress(),
+      lastDelivery: lastDelivery(),
     });
   }
   if (req.method === "POST" && url.pathname === "/ingress/matrix") {

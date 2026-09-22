@@ -13,6 +13,9 @@ export const INGRESS_QUEUE_FILE = join(STATE_DIR, "ingress-queue.json");
 export const LAST_INGRESS_FILE = join(STATE_DIR, "last-ingress.json");
 export const ISSUES_DIR = join(STATE_DIR, "issues");
 export const SPAWNS_FILE = join(STATE_DIR, "spawns.json");
+export const LAST_SUMMARY_FILE = join(STATE_DIR, "last-summary.md");
+export const LAST_SUMMARY_JSON_FILE = join(STATE_DIR, "last-summary.json");
+export const LAST_DELIVERY_FILE = join(STATE_DIR, "last-delivery.json");
 export const PLAYBOOK_SENTRY = "desk:sentry-issues";
 
 export const RESTART_RESUME_HINT =
@@ -133,6 +136,28 @@ export function deleteSpawn(taskId: string) {
   if (!(taskId in state.spawns)) return;
   delete state.spawns[taskId];
   saveSpawns(state);
+}
+
+// Written by `harness summary --deliver`: the human-delivery stub record that
+// `harness summary`, `harness gateway status` and /chat pickup can show.
+export type LastDelivery = {
+  kind: "summary";
+  at: string;
+  summaryPath: string;
+  summaryJsonPath: string;
+  deliveryPath: string;
+  bytes: number;
+  excerpt: string;
+};
+
+export function lastDelivery(): LastDelivery | null {
+  if (!existsSync(LAST_DELIVERY_FILE)) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(LAST_DELIVERY_FILE, "utf8"));
+    return parsed && typeof parsed === "object" ? (parsed as LastDelivery) : null;
+  } catch {
+    return null;
+  }
 }
 
 export function findConfigPath(): string | null {

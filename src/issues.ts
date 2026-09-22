@@ -209,3 +209,36 @@ export function listIssueDrafts(): IssueDraft[] {
   out.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
   return out;
 }
+
+// Pick priority: drafts carry the event level both as a label and in raw.level.
+// Higher severity wins; unknown/missing levels rank lowest ("other").
+const SEVERITY_RANK: Record<string, number> = {
+  fatal: 4,
+  error: 3,
+  warning: 2,
+  info: 1,
+};
+
+export function issueSeverity(draft: IssueDraft): string {
+  const candidates: unknown[] = [
+    ...(draft.labels ?? []),
+    isRecord(draft.raw) ? draft.raw.level : null,
+  ];
+  let best = "other";
+  for (const candidate of candidates) {
+    const name = typeof candidate === "string" ? candidate.toLowerCase() : "";
+    if ((SEVERITY_RANK[name] ?? 0) > (SEVERITY_RANK[best] ?? 0)) best = name;
+  }
+  return best;
+}
+
+// Ordered for picking: severity desc, then createdAt desc, then fingerprint
+// for determinism. listIssueDrafts stays createdAt-only for `issues list`.
+export function rankIssueDrafts(drafts: IssueDraft[]): IssueDraft[] {
+  return [...drafts].sort((a, b) => {
+    const diff = (SEVERITY_RANK[issueSeverity(b)] ?? 0) - (SEVERITY_RANK[issueSeverity(a)] ?? 0);
+    if (diff !== 0) return diff;
+    if (a.createdAt !== b.createdAt) return a.createdAt < b.createdAt ? 1 : -1;
+    return a.fingerprint < b.fingerprint ? -1 : a.fingerprint > b.fingerprint ? 1 : 0;
+  });
+}

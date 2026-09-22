@@ -91,7 +91,7 @@ if (mode === "happy") {
   });
   const status = await request("/status");
   assert.equal(status.status, 200);
-  assert.deepEqual(await status.json(), { ok: true, listening: true, version: VERSION, bind, lastEvent: null });
+  assert.deepEqual(await status.json(), { ok: true, listening: true, version: VERSION, bind, lastEvent: null, lastDelivery: null });
   for (const [path, method, body] of [["/missing", "GET"], ["/missing", "POST", "{"], ["/health", "POST", "{"], ["/ingress/matrix", "GET"], ["/chat", "PUT", "{"]]) {
     const response = await request(path!, method, body);
     assert.equal(response.status, 404, `${method} ${path}`);
