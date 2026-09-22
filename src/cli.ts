@@ -36,7 +36,12 @@ import {
   type SpawnRecord,
 } from "./shared.ts";
 import { lastIngress } from "./gateway.ts";
-import { ingestErrorEvent, listIssueDrafts } from "./issues.ts";
+import {
+  ingestErrorEvent,
+  listIssueDrafts,
+  ghIssueCreateArgv,
+  publishIssueDraft,
+} from "./issues.ts";
 
 const BIN_PATH = join(ROOT, "bin", "harness");
 const LINK_PATH = join(homedir(), ".local", "bin", "harness");
@@ -837,6 +842,7 @@ async function cmdIssues() {
     return;
   }
   if (sub === "ingest") {
+    const execute = argvFlags(4).has("--execute");
     const source = (optValue("--source", 4) || positional(4)[0] || "") as string;
     if (source !== "sentry" && source !== "bugsink") {
       printJson({
@@ -848,13 +854,34 @@ async function cmdIssues() {
     try {
       const raw = await readJsonPayload(4);
       const draft = ingestErrorEvent(source, raw);
+      if (!execute) {
+        printJson({
+          ok: true,
+          mode: "dry-run",
+          github: "not called (mock-draft)",
+          intendedCommand: ["gh", ...ghIssueCreateArgv(draft)],
+          playbook: PLAYBOOK_SENTRY,
+          path: draft.path,
+          draft,
+        });
+        return;
+      }
+      const result = publishIssueDraft(draft);
       printJson({
-        ok: true,
-        github: "not called (mock-draft)",
+        ok: result.ok,
+        mode: "executed",
+        github: {
+          command: result.command,
+          status: result.status,
+          ...(result.ok
+            ? { url: result.url ?? null, issueNumber: result.issueNumber ?? null }
+            : { error: result.error, stderr: result.stderr }),
+        },
         playbook: PLAYBOOK_SENTRY,
-        path: draft.path,
-        draft,
+        path: result.draft.path,
+        draft: result.draft,
       });
+      if (!result.ok) process.exit(1);
     } catch (e) {
       printJson({ ok: false, error: String(e) });
       process.exit(1);
@@ -864,7 +891,10 @@ async function cmdIssues() {
   printJson({
     ok: false,
     error: sub ? `unknown issues subcommand: ${sub}` : "missing issues subcommand",
-    usage: ["harness issues ingest --source sentry|bugsink [--file PATH]", "harness issues list"],
+    usage: [
+      "harness issues ingest --source sentry|bugsink [--file PATH] [--execute]",
+      "harness issues list",
+    ],
   });
   process.exit(1);
 }
@@ -1003,10 +1033,10 @@ function cmdSummary() {
       ? config.playbooks.map((p) => `- \`${p.id}\` ${p.description ?? ""}`.trim())
       : [`- (none; bundled id \`${PLAYBOOK_SENTRY}\`)`]),
     ``,
-    `## Mock issue drafts (${drafts.length}) — GitHub not called`,
+    `## Issue drafts (${drafts.length})`,
     ...(!drafts.length
       ? ["- none"]
-      : drafts.map((d) => `- ${d.createdAt} \`${d.fingerprint}\` ${d.title} (${d.path})`)),
+      : drafts.map((d) => `- ${d.createdAt} \`${d.fingerprint}\` [${d.status}] ${d.title} (${d.path})`)),
     ``,
     `## Gateway last event`,
     last
@@ -1047,8 +1077,9 @@ Usage:
   harness gateway start [--foreground]  Local HTTP ingress (default 127.0.0.1:8787)
   harness gateway status                Pid, bind, lastEvent
   harness gateway stop                  Stop background gateway
-  harness issues ingest --source sentry|bugsink [--file PATH]
-  harness issues list                   Mock GH issue drafts (no GitHub API)
+  harness issues ingest --source sentry|bugsink [--file PATH] [--execute]
+                                        Mock draft by default; --execute runs real gh issue create
+  harness issues list                   Issue drafts (mock or github-created)
   harness pick                          Next task: mock issues > config tasks > freeform
   harness summary                       On-demand markdown report (no cron)
 

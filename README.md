@@ -35,7 +35,7 @@ herdr --session harness plugin action list --plugin harness
 | `harness gateway start` | Background localhost HTTP + chat UI (`http://127.0.0.1:8787/`) |
 | `harness gateway status` | Listening?, pid, bind, lastEvent |
 | `harness gateway stop` | Stop by pid file |
-| `harness issues ingest --source sentry\|bugsink` | Mock GH issue draft from JSON stdin/`--file` (no GitHub API) |
+| `harness issues ingest --source sentry\|bugsink` | Mock GH issue draft from JSON stdin/`--file` (no GitHub API); `--execute` also runs a real `gh issue create` |
 | `harness issues list` | Drafts under `~/.local/state/herdr-harness/issues/` |
 | `harness pick` | Next work: mock issues → named tasks (list order) → freeform queue |
 | `harness summary` | On-demand markdown report (`--json` ok). **No cron.** |
@@ -71,12 +71,12 @@ Executed spawns persist minimal metadata (taskId → worktree path, workspace/ta
 
 ## Mock issues + pick/summary (on-demand)
 
-Playbook **`desk:sentry-issues`**. Ingest never calls GitHub.
+Playbook **`desk:sentry-issues`**. Ingest writes a local mock draft and never calls GitHub — **mock is the default**. Passing `--execute` additionally runs `gh issue create` (title/body/labels derived from the draft, minus the `mock` label) using the repo `gh` detects from your cwd; on success the draft is rewritten with `status: "github-created"` plus `githubIssueUrl`/`githubIssueNumber`. Any `gh` failure (missing binary, not authed, non-zero exit) exits 1 and keeps the mock draft on disk. The gateway ingress stays mock-only.
 
 ```bash
 echo '{"event_id":"abc","project":"harness","message":"TypeError: boom","culprit":"src/cli.ts","level":"error"}' \
-  | harness issues ingest --source sentry
-harness issues ingest --source bugsink --file event.json
+  | harness issues ingest --source sentry            # mock draft, no gh
+harness issues ingest --source bugsink --file event.json --execute   # real gh issue create
 harness issues list
 harness pick --json
 harness summary
@@ -169,4 +169,4 @@ bun run test
 
 ## Not in this MVP
 
-Fleet metrics, release-please, live Matrix/Telegram, GitHub issue create, cron.
+Fleet metrics, release-please, live Matrix/Telegram, cron. Real GitHub issue create is opt-in only (`issues ingest --execute`); the gateway never calls GitHub.
