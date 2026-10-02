@@ -155,12 +155,12 @@ No adapter that talks to a network or an LLM may run; fixtures are local shell s
 
 ## Done criteria
 
-- [ ] Focused and full Bun suites exit 0.
-- [ ] A route kind outside the allowlist never spawns a process, and the error names the config key that would permit it.
-- [ ] Execute is refused when the bind is not loopback unless explicitly opted in.
-- [ ] Execute is refused for a foreign `Origin` unless explicitly allowed.
-- [ ] All existing stub replies, status codes and adapter argv shapes are unchanged for allowlisted loopback use.
-- [ ] README documents the gate; `git diff --check` passes; file scope respected; index row updated.
+- [x] Focused and full Bun suites exit 0.
+- [x] A route kind outside the allowlist never spawns a process, and the error names the config key that would permit it.
+- [x] Execute is refused when the bind is not loopback unless explicitly opted in.
+- [x] Execute is refused for a foreign `Origin` unless explicitly allowed.
+- [x] All existing stub replies, status codes and adapter argv shapes are unchanged for allowlisted loopback use.
+- [x] README documents the gate; `git diff --check` passes; file scope respected; index row updated.
 
 ## STOP conditions
 

@@ -143,13 +143,33 @@ Ingress returns **202** and runs manager route in-process (no herdr spawn). Queu
 
 All five POST routes (`/chat` and `/ingress/matrix`, `/ingress/telegram`, `/ingress/sentry`, `/ingress/bugsink`) return **400** with `{ "ok": false, "error": "..." }` for invalid input: `invalid JSON` for malformed JSON or an empty body; `expected JSON object` for top-level null, arrays or scalars; `invalid payload shape` for non-object Matrix `content` or Telegram `message`, `chat` or `from` containers. Optional containers may be absent or null; Telegram checks `chat` and `from` on the selected message (nested `message`, or the top-level fallback). Empty objects and extra fields remain accepted; this is not full provider-schema validation. Rejected input does not write state. Success statuses remain **200** for `/chat` and **202** for the four ingress routes; GET and unknown-route behavior is unchanged.
 
+### `/chat execute` gate
+
+**`POST /chat` is unauthenticated by design. Anyone who can reach the port can POST, and with execute they can spawn processes. Never expose the gateway to an untrusted network.** Stub mode (no `execute`) still works on any bind — the gate only applies to execution, and it refuses by returning the normal **200** stub reply with an `executeError` instead of running anything.
+
+Three checks must all pass before a subprocess is spawned:
+
+1. **Kind allowlist.** The route `kind` (or the default adapter id for freeform text) is the binary. It must be one of the built-in non-interactive kinds — `claude`, `codex`, `gemini`, `grok`, `opencode` — or listed in `adapters.chat.executeKinds` in `.herdr-harness.json`. Anything else is refused, because the repository's config, not the harness, names the binary:
+
+   ```json
+   { "adapters": { "chat": { "executeKinds": ["anyr"] } } }
+   ```
+
+   Default-deny: a kind nobody allowlisted never runs, and `HARNESS_CHAT_EXECUTE=1` does not override it. Treat widening `executeKinds` as a security review.
+2. **Loopback bind.** Execution requires `HARNESS_GATEWAY_HOST` to be a loopback address (`localhost`, `::1`, or anything in `127.0.0.0/8`). Set `HARNESS_CHAT_ALLOW_REMOTE=1` to execute anyway — the LAN-exposed case.
+3. **Browser `Origin`.** If a request carries an `Origin` header that is not listed in `HARNESS_CHAT_ALLOW_ORIGIN` (comma-separated, default empty), execute is refused — any web page could otherwise trigger it cross-origin with a CORS-simple request. Requests with no `Origin` (curl, a local script) are allowed. This is a cross-origin guard, not authentication, and it adds no CORS headers.
+
+`/chat` remains stub-shaped under every refusal: `ok: true`, `mode: "stub"`, the usual stub `reply`, and an `executeError` naming the kind or the setting you need. There is no `execute` detail object, because nothing was invoked.
+
 ### Env
 
 | Var | Used now | Later |
 | --- | --- | --- |
 | `HARNESS_GATEWAY_HOST` | bind host (default `127.0.0.1`) | |
 | `HARNESS_GATEWAY_PORT` | bind port (default `8787`) | |
-| `HARNESS_CHAT_EXECUTE` | `1`/`true`/`yes`/`on` makes `/chat` run the adapter CLI | |
+| `HARNESS_CHAT_EXECUTE` | `1`/`true`/`yes`/`on` makes `/chat` run the adapter CLI (still subject to the gate) | |
+| `HARNESS_CHAT_ALLOW_REMOTE` | `1`/`true`/`yes`/`on` allows execute on a non-loopback bind | |
+| `HARNESS_CHAT_ALLOW_ORIGIN` | comma-separated `Origin` values allowed to execute (default empty) | |
 | `HARNESS_CHAT_TIMEOUT_MS` | `/chat` adapter timeout (default `10000`, clamped 100–60000) | |
 | `HARNESS_MATRIX_TOKEN` | unused | Matrix client |
 | `HARNESS_MATRIX_HOMESERVER` | unused | Matrix client |

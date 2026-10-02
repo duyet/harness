@@ -49,9 +49,16 @@ export type AdapterRoute = {
   flags?: string[];
 };
 
+export type ChatAdapters = {
+  // Extra route kinds `/chat execute` may spawn, on top of the built-in
+  // non-interactive agent CLIs. Treat widening this list as a security review.
+  executeKinds?: string[];
+};
+
 export type Adapters = {
   default?: string;
   routes?: Record<string, AdapterRoute>;
+  chat?: ChatAdapters;
 };
 
 export type Task = {

@@ -14,8 +14,15 @@ import {
 } from "./shared.ts";
 import { ingestErrorEvent } from "./issues.ts";
 import {
+  CHAT_ALLOW_ORIGIN_ENV,
+  CHAT_ALLOW_REMOTE_ENV,
+  CHAT_BUILTIN_KINDS,
+  CHAT_EXECUTE_KINDS_CONFIG_KEY,
   chatAdapterArgv,
+  chatAdapterKind,
+  chatEnvEnabled,
   chatExecuteEnabled,
+  chatKindAllowed,
   chatTimeoutMs,
   invokeAdapter,
 } from "./chat.ts";
@@ -162,17 +169,99 @@ function stubReply(result: ReturnType<typeof handleIngress>): string {
   return `stub: routed task ${t.id} → adapter ${t.adapterId} (${kind}). No LLM.`;
 }
 
+// --- /chat execute gate ------------------------------------------------------
+// Reaching POST /chat means reaching the harness's ability to spawn processes:
+// the endpoint is unauthenticated by design and takes the binary name from the
+// repo config. Execution therefore needs all three of an allowlisted route
+// kind, a loopback bind (unless HARNESS_CHAT_ALLOW_REMOTE=1) and a browser
+// Origin that is absent or listed in HARNESS_CHAT_ALLOW_ORIGIN. Ingress without
+// `execute` is untouched by any of this.
+
+const LOOPBACK_HOSTNAMES = new Set(["localhost", "::1", "0:0:0:0:0:0:0:1"]);
+
+export function isLoopbackHostname(hostname: string): boolean {
+  const h = hostname.trim().toLowerCase().replace(/^\[|]$/g, "");
+  if (LOOPBACK_HOSTNAMES.has(h)) return true;
+  // The whole 127.0.0.0/8 block is loopback, not just 127.0.0.1.
+  const octets = /^127(?:\.\d{1,3}){3}$/.exec(h)?.[0].split(".") ?? [];
+  return octets.length === 4 && octets.every((o) => Number(o) <= 255);
+}
+
+// Absent Origin (curl, a local script) is fine — this is a browser
+// cross-origin guard, not authentication, and it adds no CORS headers.
+export function chatOriginAllowed(origin: string | null): boolean {
+  if (!origin) return true;
+  const allowed = (process.env[CHAT_ALLOW_ORIGIN_ENV] ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return allowed.includes(origin.trim());
+}
+
+type ExecuteGate = { allowed: true } | { allowed: false; error: string };
+
+function chatExecuteGate(
+  result: ReturnType<typeof handleIngress>,
+  req: Request,
+  bind: ReturnType<typeof gatewayBind>,
+): ExecuteGate {
+  if (!isLoopbackHostname(bind.hostname) && !chatEnvEnabled(CHAT_ALLOW_REMOTE_ENV)) {
+    return {
+      allowed: false,
+      error:
+        `execute refused: bind ${bind.hostname} is not a loopback address. ` +
+        `/chat is unauthenticated by design and must not be exposed to an untrusted network — ` +
+        `bind loopback with HARNESS_GATEWAY_HOST, or set ${CHAT_ALLOW_REMOTE_ENV}=1 to opt in.`,
+    };
+  }
+  const origin = req.headers.get("origin");
+  if (!chatOriginAllowed(origin)) {
+    return {
+      allowed: false,
+      error:
+        `execute refused: Origin ${origin} is not allowed. /chat is unauthenticated ` +
+        `by design and must not be exposed to an untrusted network — list the page origin ` +
+        `in ${CHAT_ALLOW_ORIGIN_ENV}, or call /chat without an Origin header.`,
+    };
+  }
+  const kind = chatAdapterKind(result.task.adapterId, result.route);
+  if (!chatKindAllowed(kind, loadConfig().config)) {
+    return {
+      allowed: false,
+      error:
+        `execute refused: route kind "${kind}" is not in the execute allowlist ` +
+        `(built-in: ${CHAT_BUILTIN_KINDS.join(", ")}). Add "${kind}" to ` +
+        `"${CHAT_EXECUTE_KINDS_CONFIG_KEY}" in .herdr-harness.json to allow it.`,
+    };
+  }
+  return { allowed: true };
+}
+
 // /chat replies: stub by default; with `"execute": true` in the body or
 // HARNESS_CHAT_EXECUTE=1 the resolved adapter CLI runs as a short bounded
-// subprocess. Any invoke failure still returns ok:true with mode:"stub" and
-// an executeError field — the chat endpoint never hangs or 500s on adapters.
+// subprocess — but only if the execute gate above allows it. Any gate refusal
+// or invoke failure still returns ok:true with mode:"stub" and an executeError
+// field — the chat endpoint never hangs or 500s on adapters.
 async function chatReply(
   result: ReturnType<typeof handleIngress>,
   raw: Record<string, unknown>,
+  req: Request,
+  bind: ReturnType<typeof gatewayBind>,
 ) {
   const adapterId = result.task.adapterId;
   if (!chatExecuteEnabled(raw)) {
     return { mode: "stub" as const, reply: stubReply(result), adapterId };
+  }
+  const gate = chatExecuteGate(result, req, bind);
+  if (!gate.allowed) {
+    // Same stub shape as an adapter failure, but nothing was spawned: no
+    // `execute` detail object, only executeError naming the missing opt-in.
+    return {
+      mode: "stub" as const,
+      reply: stubReply(result),
+      adapterId,
+      executeError: gate.error,
+    };
   }
   const prompt =
     result.task.text ?? (result.task.id ? `task: ${result.task.id}` : "");
@@ -282,7 +371,7 @@ export async function handleGatewayRequest(req: Request, bind: ReturnType<typeof
     const parsed = await parseJsonObject(req);
     if (!parsed.ok) return parsed.response;
     const result = handleIngress("chat", parsed.body);
-    const reply = await chatReply(result, parsed.body);
+    const reply = await chatReply(result, parsed.body, req, bind);
     const body: Record<string, unknown> = {
       ok: true,
       ...reply,

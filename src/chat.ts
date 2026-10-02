@@ -1,8 +1,12 @@
 import { spawn } from "node:child_process";
-import type { AdapterRoute } from "./shared.ts";
+import type { AdapterRoute, HarnessConfig } from "./shared.ts";
 
 export const CHAT_EXECUTE_ENV = "HARNESS_CHAT_EXECUTE";
+export const CHAT_ALLOW_REMOTE_ENV = "HARNESS_CHAT_ALLOW_REMOTE";
+export const CHAT_ALLOW_ORIGIN_ENV = "HARNESS_CHAT_ALLOW_ORIGIN";
 export const CHAT_TIMEOUT_ENV = "HARNESS_CHAT_TIMEOUT_MS";
+// The .herdr-harness.json key that allowlists extra executable route kinds.
+export const CHAT_EXECUTE_KINDS_CONFIG_KEY = "adapters.chat.executeKinds";
 export const DEFAULT_CHAT_TIMEOUT_MS = 10_000;
 const MAX_TIMEOUT_MS = 60_000;
 const MAX_OUTPUT_BYTES = 64 * 1024;
@@ -23,11 +27,45 @@ function errText(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
+// Shared truthy env-flag semantics for every chat opt-in below.
+export function chatEnvEnabled(name: string): boolean {
+  return /^(1|true|yes|on)$/i.test(process.env[name] ?? "");
+}
+
 export function chatExecuteEnabled(raw: Record<string, unknown>): boolean {
   const field =
     raw.execute === true || raw.execute === "true" || raw.execute === "1";
-  const env = /^(1|true|yes|on)$/i.test(process.env[CHAT_EXECUTE_ENV] ?? "");
-  return field || env;
+  return field || chatEnvEnabled(CHAT_EXECUTE_ENV);
+}
+
+// Route kinds that are allowed to run without being named in the config.
+// Built-in kinds are the agent CLIs in NONINTERACTIVE_ARGS.
+export const CHAT_BUILTIN_KINDS: readonly string[] = Object.keys(NONINTERACTIVE_ARGS);
+
+// Execute is default-deny on the route kind: the repository's config names the
+// binary, and an unlisted kind must never reach spawn(). A kind is allowed when
+// it is a built-in non-interactive agent CLI, or when the config lists it under
+// adapters.chat.executeKinds. Widening executeKinds is a security decision.
+export function chatKindAllowed(
+  kind: string,
+  config: HarnessConfig | null,
+): boolean {
+  if (!kind) return false;
+  // Own-property only: a route kind of "constructor" must not match the
+  // prototype chain and slip through as allowlisted.
+  if (Object.hasOwn(NONINTERACTIVE_ARGS, kind)) return true;
+  const extra = config?.adapters?.chat?.executeKinds;
+  if (!Array.isArray(extra)) return false;
+  return extra.some((k) => typeof k === "string" && k === kind);
+}
+
+// The kind chatAdapterArgv puts at argv[0]; the gate and the argv builder must
+// agree on it, so both derive it here. argv shape is unchanged.
+export function chatAdapterKind(
+  adapterId: string,
+  route: AdapterRoute | null,
+): string {
+  return route?.kind || adapterId;
 }
 
 export function chatTimeoutMs(): number {
@@ -43,7 +81,7 @@ export function chatAdapterArgv(
   route: AdapterRoute | null,
   prompt: string,
 ): string[] {
-  const kind = route?.kind || adapterId;
+  const kind = chatAdapterKind(adapterId, route);
   const argv = [
     kind,
     ...(route?.via ? [route.via] : []),

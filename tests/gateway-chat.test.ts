@@ -45,6 +45,17 @@ beforeEach(() => {
     JSON.stringify({
       adapters: {
         default: "fixture-adapter",
+        // /chat execute is default-deny per route kind; the fixture's own
+        // kinds are allowlisted here so the adapter cases below still spawn.
+        chat: {
+          executeKinds: [
+            "fixture-adapter",
+            "fixture-chat",
+            "fixture-hang",
+            "fixture-fail",
+            "fixture-absent-bin",
+          ],
+        },
         routes: {
           "fixture-adapter": { kind: "fixture-chat" },
           "hang-adapter": { kind: "fixture-hang" },

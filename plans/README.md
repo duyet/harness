@@ -66,7 +66,7 @@ Prefer **007** and **008** first (integrity + security). 009–011 may follow in
 | 005 | Make executed manager failures return a nonzero CLI status | DONE | 001 |
 | 006 | Wire manager spawn child tab/agent and cleanup UX | DONE | 001, 005 |
 | 007 | Make issue ingest idempotent and publish deduplicated | OPEN | 001, 002 |
-| 008 | Gate `/chat execute` behind bind/origin/kind checks | OPEN | 001, 004 |
+| 008 | Gate `/chat execute` behind bind/origin/kind checks | DONE | 001, 004 |
 | 009 | Bound `gh issue create` with timeout and closed stdin | OPEN | 001 |
 | 010 | Bound gateway ingress state growth; stop raw `/status` echo | OPEN | 001, 004 |
 | 011 | Surface live spawns in `manager status` + recovery hints | OPEN | 001, 006 |
