@@ -81,7 +81,7 @@ Fresh post-016 review (Herdr pane `harness-improve-run4` + `/improve` orientatio
 
 **021 last** (or whenever) — additive only; do not let a red typecheck force `src/` edits in the same PR (see its STOP conditions).
 
-> **021 executed** at `9c6121c`+ and hit that STOP exactly as written. `tsconfig.json`, the `typecheck` script and `.github/workflows/test.yml` landed; `src/` was not touched to force green. The typecheck job ships `continue-on-error: true` against a 23-error baseline (3 in `src/gateway.ts`). Clearing it is [022](022-clear-typecheck-baseline.md).
+> **021 executed** at `9c6121c`+ and hit its STOP exactly as written. `tsconfig.json` and the `typecheck` script landed in `1f4df11`; `.github/workflows/test.yml` landed separately in `fe4f640` (the first push was rejected — the OAuth token lacked the `workflow` scope — and was re-pushed with a scoped token). `src/` was not touched to force green. The typecheck job ships `continue-on-error: true` against a 23-error baseline (3 in `src/gateway.ts`). Clearing it is [022](022-clear-typecheck-baseline.md).
 
 ## Recommended execution order
 
@@ -150,7 +150,7 @@ Prefer **007** and **008** first (integrity + security). 009–011 may follow in
 | 018 | Make `executeCleanup` idempotent (failed tab-close must not wedge spawns) | DONE | 006, 013 |
 | 019 | Write all harness state files atomically (temp + rename) | DONE | none |
 | 020 | Refuse interactive stdin for `harness issues ingest` | DONE | none |
-| 021 | Add a `typecheck` script and a one-file CI workflow | BLOCKED — STOP: tip has 23 type errors (3 in `src/gateway.ts`); `tsconfig.json` + script landed, CI typecheck job ships non-blocking | 001 |
+| 021 | Add a `typecheck` script and a one-file CI workflow | BLOCKED — both halves landed (`1f4df11` script + tsconfig, `fe4f640` CI workflow; STOP 2 cleared). Still blocked on STOP 1: tip has 23 type errors (3 in `src/gateway.ts`), no `src/` greenwash — CI typecheck job ships non-blocking. See 022 | 001 |
 | 022 | Clear the 23-error typecheck baseline, then enforce the gate | OPEN | 021 |
 
 Status values: OPEN | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJECTED (with one-line rationale).

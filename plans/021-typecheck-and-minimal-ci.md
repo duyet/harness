@@ -15,7 +15,7 @@
 - **Confidence:** HIGH (deferred explicitly from Runs 1–3 as "candidates for Run 4" once 001 proved value)
 - **Planned at:** commit `5fd3cf0`, 2026-10-02 (Run 4)
 
-> **Executed — partial, via STOP.** `tsconfig.json`, `package.json#scripts.typecheck` (+ `typescript`/`@types/bun` devDeps) and `.github/workflows/test.yml` landed. The typecheck is **not green**: 23 errors, 3 in `src/gateway.ts`. The STOP condition held — no `src/` was edited to force green, and no knob was loosened to fake it (measured: `strict: false` is worse at 25; canonical `@tsconfig/bun` is 189). The CI typecheck job ships `continue-on-error: true`; the `test` job is a real blocking gate. Done-criteria boxes stay unticked. Follow-up: [022](022-clear-typecheck-baseline.md).
+> **Executed — partial, via STOP.** `tsconfig.json`, `package.json#scripts.typecheck` (+ `typescript`/`@types/bun` devDeps) and `.github/workflows/test.yml` all landed — the last in `fe4f640`, after the first push was rejected for lacking the token's `workflow` scope. The typecheck is **not green**: 23 errors, 3 in `src/gateway.ts`. The STOP condition held — no `src/` was edited to force green, and no knob was loosened to fake it (measured: `strict: false` is worse at 25; canonical `@tsconfig/bun` is 189). The CI typecheck job ships `continue-on-error: true`; the `test` job is a real blocking gate. Done-criteria boxes stay unticked. Follow-up: [022](022-clear-typecheck-baseline.md).
 
 ## Why this matters
 
