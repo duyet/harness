@@ -42,7 +42,7 @@ cat examples/herdr-config-ctrl-g.toml                       # the Ctrl+G snippet
 | `harness manager cleanup <taskId>` | Dry-run cleanup; `--execute` closes the spawned tab then removes the worktree (`--force` forces removal) |
 | `harness gateway start` | Background localhost HTTP + chat UI (`http://127.0.0.1:8787/`) |
 | `harness gateway status` | Listening?, pid, bind, lastEvent, lastDelivery |
-| `harness gateway stop` | Stop by pid file |
+| `harness gateway stop` | Stop by pid file, after verifying that pid is still a harness gateway (`--force` overrides the refusal) |
 | `harness issues ingest --source sentry\|bugsink` | Mock GH issue draft from JSON stdin/`--file` (no GitHub API); `--execute` also runs a real `gh issue create`, bounded by a timeout (default 60s, `HARNESS_GH_TIMEOUT_MS`) |
 | `harness issues list` | Drafts under `~/.local/state/herdr-harness/issues/` |
 | `harness pick` | Next work: mock issue drafts (severity-ordered) → named tasks → freeform queue |
@@ -122,6 +122,8 @@ Gateway (restart after upgrade so new routes load): `POST /ingress/sentry` and `
 Local HTTP only. **Never talks to real Matrix or Telegram APIs.** Tokens are unused placeholders.
 
 A newly started gateway uses the launching cwd to discover repo config (walking upward). Starting again while it is already running does not switch repositories; run `harness gateway stop`, then restart from the desired repo.
+
+**A stale `gateway.pid` never gets to signal a stranger.** The pid file outlives a crash or a `kill -9`, so the OS eventually hands that number to an unrelated process of yours. `gateway stop` therefore checks *who* is behind the pid before it signals anything — the pid recorded in `gateway.json` must agree, and the process command line must look like `src/gateway.ts` (or a foreground `gateway start`). Anything that fails either check is `recycled`: `gateway status` reports `"listening": false` with a `reason` naming the mismatch, and `gateway stop` exits 1 **without signalling**, unlinking the stale pid file so the next `gateway start` is not wedged. If you know the pid really is yours, `harness gateway stop --force` signals it anyway. Erring toward "not ours" is deliberate: a false refusal costs a retry, a false match destroys unrelated work.
 
 ```bash
 harness gateway start
@@ -213,7 +215,7 @@ After an in-place upgrade, **Press Ctrl+G in the agent to restart and resume.** 
 
 ## Verification
 
-Tests run on [Bun](https://bun.sh) with its built-in runner — no Herdr server or gateway needed:
+Tests run on [Bun](https://bun.sh) with its built-in runner — no Herdr server or already-running gateway needed:
 
 ```bash
 bun run test
@@ -221,6 +223,7 @@ bun run test
 
 - `tests/baseline.test.ts` covers session persistence, routing, issue normalization and pick rotation through `src/cli.ts`.
 - `tests/ctrl-g.test.ts` pins the Ctrl+G example snippet, the `harness.resume` plugin action id, and the `ctrlGHint` fields in `status --json`/`upgrade`.
+- `tests/gateway-pid.test.ts` covers the gateway lifecycle end to end — a real `start`/`status`/`stop` on an isolated port, plus the recycled-pid cases: `stop` must not signal a pid it could not verify, `--force` must, and a stale pid file must not wedge the next `start`.
 - Each test runs the CLI in an isolated subprocess fixture under `dist/.test-tmp/` (own `HOME`, cwd and `TMPDIR`); nothing touches the real home or state directories.
 - There are no lint or typecheck gates in this repo, and `bun test` does not typecheck.
 

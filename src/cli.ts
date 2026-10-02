@@ -732,6 +732,18 @@ function cmdManagerCleanup() {
   if (!cleanup.ok) process.exit(1);
 }
 
+/**
+ * Who, if anyone, is behind the pid in gateway.pid. A bare `kill(pid, 0)` only proves
+ * *some* process holds that number — gateway.pid outlives a crash, so the OS eventually
+ * recycles it onto unrelated user work. Every signal we send has to clear this first.
+ */
+type PidIdentity =
+  | { kind: "gateway" }
+  | { kind: "not-running" }
+  | { kind: "recycled"; command: string | null };
+
+type GatewayMeta = { pid?: unknown; bind?: ReturnType<typeof gatewayBind> };
+
 function pidAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -747,19 +759,78 @@ function readPid(): number | null {
   return Number.isFinite(n) && n > 0 ? n : null;
 }
 
-function gatewayListening(): { pid: number | null; bind: ReturnType<typeof gatewayBind>; alive: boolean; lastEvent: unknown; lastDelivery: LastDelivery | null } {
-  const pid = readPid();
-  const alive = pid != null && pidAlive(pid);
-  let bind = gatewayBind();
-  if (existsSync(GATEWAY_META_FILE)) {
-    try {
-      const meta = JSON.parse(readFileSync(GATEWAY_META_FILE, "utf8"));
-      if (meta.bind) bind = meta.bind;
-    } catch {
-      /* ignore */
-    }
+/** gateway.json, written by the gateway process itself. Absent or corrupt is not a match. */
+function readGatewayMeta(): GatewayMeta | null {
+  if (!existsSync(GATEWAY_META_FILE)) return null;
+  try {
+    const meta = JSON.parse(readFileSync(GATEWAY_META_FILE, "utf8"));
+    return meta && typeof meta === "object" ? (meta as GatewayMeta) : null;
+  } catch {
+    return null;
   }
-  return { pid, bind, alive, lastEvent: lastIngress(), lastDelivery: lastDelivery() };
+}
+
+function processCommand(pid: number): string | null {
+  try {
+    const raw = readFileSync(`/proc/${pid}/cmdline`, "utf8").replace(/\0/g, " ").trim();
+    if (raw) return raw;
+  } catch {
+    /* not readable here — fall back to ps */
+  }
+  try {
+    const r = spawnSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8", timeout: 2000 });
+    if (r.status === 0) {
+      const out = (r.stdout || "").trim();
+      if (out) return out;
+    }
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
+/**
+ * A harness gateway is one of two processes: the detached `src/gateway.ts` that
+ * `gateway start` spawns, or the CLI itself when `--foreground` serves in-process.
+ */
+function looksLikeGateway(command: string): boolean {
+  if (command.includes("gateway.ts")) return true;
+  const word = (w: string) => new RegExp(`(^|\\s)${w}(\\s|$)`).test(command);
+  return command.includes("cli.ts") && word("gateway") && word("start");
+}
+
+/**
+ * Layered evidence, cheapest first. Step 1 can only refuse; confirming needs the command
+ * line, so a missing or corrupt gateway.json falls through rather than counting as proof.
+ * "Cannot verify" always resolves to `recycled` — a false refusal is recoverable, a false
+ * match destroys an unrelated process.
+ */
+function pidIdentity(pid: number | null): PidIdentity {
+  if (pid == null || !pidAlive(pid)) return { kind: "not-running" };
+  const metaPid = readGatewayMeta()?.pid;
+  if (typeof metaPid === "number" && Number.isFinite(metaPid) && metaPid !== pid) {
+    return { kind: "recycled", command: processCommand(pid) };
+  }
+  const command = processCommand(pid);
+  if (command == null || !looksLikeGateway(command)) return { kind: "recycled", command };
+  return { kind: "gateway" };
+}
+
+function recycledReason(pid: number | null, command: string | null): string {
+  const metaPid = readGatewayMeta()?.pid;
+  const recorded = typeof metaPid === "number" && Number.isFinite(metaPid) ? String(metaPid) : "none";
+  return `pid ${pid ?? "?"} is not a harness gateway (gateway.json pid: ${recorded}; running command: ${command ?? "unknown"})`;
+}
+
+function gatewayListening(): { pid: number | null; bind: ReturnType<typeof gatewayBind>; alive: boolean; lastEvent: unknown; lastDelivery: LastDelivery | null; identity?: PidIdentity } {
+  const pid = readPid();
+  const identity = pidIdentity(pid);
+  let bind = gatewayBind();
+  const metaBind = readGatewayMeta()?.bind;
+  if (metaBind) bind = metaBind;
+  // `alive` now means "a verified gateway", not "a live pid" — additive `identity` keeps
+  // the refusal explainable without changing the fields existing consumers already read.
+  return { pid, bind, alive: identity.kind === "gateway", lastEvent: lastIngress(), lastDelivery: lastDelivery(), identity };
 }
 
 async function waitHealth(bind: { hostname: string; port: number }, timeoutMs = 4000) {
@@ -826,6 +897,13 @@ async function cmdGatewayStart() {
 
 function cmdGatewayStatus() {
   const g = gatewayListening();
+  const identity = g.identity;
+  const reason =
+    identity?.kind === "recycled"
+      ? recycledReason(g.pid, identity.command)
+      : identity?.kind === "not-running"
+        ? "not running"
+        : null;
   printJson({
     ok: true,
     listening: g.alive,
@@ -834,14 +912,29 @@ function cmdGatewayStatus() {
     lastEvent: g.lastEvent,
     lastDelivery: g.lastDelivery,
     version: VERSION,
+    ...(identity ? { identity } : {}),
+    ...(reason ? { reason } : {}),
   });
 }
 
 function cmdGatewayStop() {
+  const force = argvFlags(4).has("--force");
   const pid = readPid();
-  if (pid == null || !pidAlive(pid)) {
+  const identity = pidIdentity(pid);
+  if (pid == null || identity.kind === "not-running") {
     printJson({ ok: true, stopped: false, reason: "not running" });
     return;
+  }
+  if (identity.kind === "recycled" && !force) {
+    const reason = recycledReason(pid, identity.command);
+    // Clearing the stale file is the recovery: leaving it wedges `gateway start` forever.
+    try {
+      unlinkSync(GATEWAY_PID_FILE);
+    } catch {
+      /* ignore */
+    }
+    printJson({ ok: false, stopped: false, refused: true, pid, reason, removedPidFile: true });
+    process.exit(1);
   }
   try {
     process.kill(pid, "SIGTERM");
@@ -1172,7 +1265,7 @@ async function cmdGateway() {
   printJson({
     ok: false,
     error: sub ? `unknown gateway subcommand: ${sub}` : "missing gateway subcommand",
-    usage: ["harness gateway start [--foreground]", "harness gateway status", "harness gateway stop"],
+    usage: ["harness gateway start [--foreground]", "harness gateway status", "harness gateway stop [--force]"],
   });
   process.exit(1);
 }
@@ -1191,7 +1284,7 @@ Usage:
   harness manager cleanup <taskId>      Close spawned tab + remove worktree (--execute, --force)
   harness gateway start [--foreground]  Local HTTP ingress (default 127.0.0.1:8787)
   harness gateway status                Pid, bind, lastEvent
-  harness gateway stop                  Stop background gateway
+  harness gateway stop                  Stop background gateway (--force overrides a recycled-pid refusal)
   harness issues ingest --source sentry|bugsink [--file PATH] [--execute]
                                         Mock draft by default; --execute runs real gh issue create
   harness issues list                   Issue drafts (mock or github-created)
