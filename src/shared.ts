@@ -106,10 +106,24 @@ export function gitDescribe(): string | null {
   return s || null;
 }
 
+// Plan 025 taught `gateway.ts`'s readers to check the shape they got rather
+// than the shape they asked for, and promoted the check into `readJsonFile`.
+// It left this file's three readers alone, and the helper cannot move here
+// without `shared.ts` importing `gateway.ts` — the wrong way round, since
+// `gateway.ts` already imports everything below. So the check is duplicated
+// beside each parse instead: three lines, not a module.
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 export function loadState(): State {
   if (!existsSync(STATE_FILE)) return { started: false };
   try {
-    return JSON.parse(readFileSync(STATE_FILE, "utf8")) as State;
+    const parsed: unknown = JSON.parse(readFileSync(STATE_FILE, "utf8"));
+    // An array or a scalar parses just as cleanly as an object, and the next
+    // writer would spread it into `{ "0": …, "1": …, lastPicked: {…} }` —
+    // `started` and `sessionId` gone, so `start --resume` mints a fresh id.
+    return isRecord(parsed) ? (parsed as State) : { started: false };
   } catch {
     return { started: false };
   }
@@ -171,8 +185,17 @@ export type SpawnsState = { spawns: Record<string, SpawnRecord> };
 export function loadSpawns(): SpawnsState {
   if (!existsSync(SPAWNS_FILE)) return { spawns: {} };
   try {
-    const parsed = JSON.parse(readFileSync(SPAWNS_FILE, "utf8"));
-    return { spawns: parsed?.spawns ?? {} };
+    const parsed: unknown = JSON.parse(readFileSync(SPAWNS_FILE, "utf8"));
+    // The array-shaped file is the one that loses data quietly. `saveSpawn`
+    // assigns a named key onto whatever this returns, and `JSON.stringify` of
+    // an array drops named properties — so the record `manager spawn
+    // --execute` just wrote (worktree, tab and agent already created) is gone
+    // on the next read, and the "task already spawned" guard in `src/cli.ts`
+    // reads the same empty map. The next spawn then builds a *second*
+    // worktree and tab for a task that is already live: exactly the outcome
+    // the atomic-write comment below this function exists to prevent.
+    const spawns = isRecord(parsed) ? parsed.spawns : undefined;
+    return { spawns: isRecord(spawns) ? (spawns as Record<string, SpawnRecord>) : {} };
   } catch {
     return { spawns: {} };
   }
@@ -208,11 +231,34 @@ export type LastDelivery = {
   excerpt: string;
 };
 
+// `/chat` pickup interpolates `at` and `excerpt` straight into the reply and
+// `/status` projects the rest, so the cast this replaces rendered whatever
+// parsed. The two shapes that reach a human's chat window are an array — which
+// inherits `Array.prototype.at`, hence a reply reading `last summary (function
+// at() { [native code] })` — and a partial object, which renders `undefined`.
+// `writeSummaryDelivery` in `src/cli.ts` is the only writer and writes all
+// seven fields, so requiring them costs no real record; a file that is not a
+// delivery reads as no delivery, which is the direction that fails quietly
+// rather than loudly wrong.
+function isLastDelivery(value: unknown): value is LastDelivery {
+  return (
+    isRecord(value) &&
+    value.kind === "summary" &&
+    typeof value.at === "string" &&
+    typeof value.summaryPath === "string" &&
+    typeof value.summaryJsonPath === "string" &&
+    typeof value.deliveryPath === "string" &&
+    typeof value.excerpt === "string" &&
+    typeof value.bytes === "number" &&
+    Number.isFinite(value.bytes)
+  );
+}
+
 export function lastDelivery(): LastDelivery | null {
   if (!existsSync(LAST_DELIVERY_FILE)) return null;
   try {
-    const parsed = JSON.parse(readFileSync(LAST_DELIVERY_FILE, "utf8"));
-    return parsed && typeof parsed === "object" ? (parsed as LastDelivery) : null;
+    const parsed: unknown = JSON.parse(readFileSync(LAST_DELIVERY_FILE, "utf8"));
+    return isLastDelivery(parsed) ? parsed : null;
   } catch {
     return null;
   }
