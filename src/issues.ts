@@ -35,10 +35,27 @@ function str(v: unknown): string | null {
   return typeof v === "string" && v ? v : null;
 }
 
+// The id branch returns the caller's identifier verbatim, because the id *is*
+// the draft's identity — plans 023 and 030 both depend on the whole of it
+// reaching storage.
+//
+// The fallback hashes the **whole** serialized payload, and plan 033 is what
+// made that true. It used to be `JSON.stringify(raw).slice(0, 200)`, which is
+// not a bound but a collision: two incidents that agree through character 200
+// hashed identically, shared one `sentry-<key>.json` path, and the second
+// silently overwrote the first. If the first had been published, the second
+// inherited its URL and `github-created` status, so plan 007's once-only guard
+// suppressed a genuine second alert permanently — with the unauthenticated
+// `/ingress/sentry` 202 reporting the outcome as published.
+//
+// Nothing bounds a pre-image. `createHash` takes a string of any length, so
+// there was never a cost reason to cut; if a bound is wanted it belongs on the
+// *digest*, which the `.slice(0, 16)` below already is. Truncating the input to
+// a hash is what loses the event; truncating the hex never does.
 export function fingerprintFor(raw: Record<string, unknown>): string {
   const id = str(raw.event_id) || str(raw.eventId) || str(raw.id);
   if (id) return id;
-  const msg = str(raw.message) || str(raw.title) || JSON.stringify(raw).slice(0, 200);
+  const msg = str(raw.message) || str(raw.title) || JSON.stringify(raw);
   const culprit = str(raw.culprit) || str(raw.transaction) || "";
   return createHash("sha256").update(`${msg}|${culprit}`).digest("hex").slice(0, 16);
 }
@@ -79,7 +96,10 @@ function buildDraft(
   const level = capHeader(str(raw.level) || "error");
   // Fingerprint the *full* payload, before anything below is cut: two large
   // events that share a prefix must not collapse onto one fingerprint and lose
-  // a real report.
+  // a real report. (Plan 033: the ordering was always right, but
+  // `fingerprintFor` then cut its own input to 200 characters, so this was
+  // true only of the call and not of the function. It hashes the whole
+  // serialized payload now.)
   const fingerprint = fingerprintFor(raw);
   // ...but it is capped where it enters the *body*, at the same bound as the
   // lines above. `fingerprintFor` returns a caller-supplied `event_id` /
