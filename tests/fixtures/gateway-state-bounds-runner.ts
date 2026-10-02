@@ -14,7 +14,7 @@ function unexpected(name: string): never {
 spyOn(Bun, "serve").mockImplementation(() => unexpected("Bun.serve"));
 spyOn(globalThis, "fetch").mockImplementation(() => unexpected("fetch"));
 
-const { STATE_DIR, INGRESS_QUEUE_FILE, LAST_INGRESS_FILE } = await import("../../src/shared.ts");
+const { STATE_DIR, INGRESS_QUEUE_FILE, LAST_INGRESS_FILE, LAST_DELIVERY_FILE } = await import("../../src/shared.ts");
 assert.equal(STATE_DIR, join(home, ".local", "state", "herdr-harness"));
 const { handleGatewayRequest } = await import("../../src/gateway.ts");
 const bind = { hostname: "127.0.0.1", port: 8787 };
@@ -22,6 +22,8 @@ const bind = { hostname: "127.0.0.1", port: 8787 };
 // Distinctive enough that finding it anywhere in a /status response means the
 // raw payload leaked through the projection.
 const MARKER = "harness-ingress-marker-8f3a2b";
+// Stands in for the report body the delivery record carries.
+const DELIVERY_MARKER = "harness-delivery-marker-c4d9e1";
 const BODY_MAX_BYTES = 4 * 1024;
 const TEXT_MAX_CHARS = 200;
 const QUEUE_MAX_EVENTS = 50;
@@ -167,6 +169,64 @@ if (mode === "verbatim") {
   assert.equal(projected.textTruncated, true);
   assert.equal(projected.textBytes, event.textBytes);
   detail = { originalBytes, marker: MARKER };
+} else if (mode === "delivery") {
+  // Nothing delivered yet: the field is present and null, not an empty
+  // projection, so a caller can tell "no delivery" from "delivery with no data".
+  const empty = await getStatus();
+  assert.equal(empty.json.lastDelivery, null);
+
+  // A planted record whose paths all sit under the fixture home. The home
+  // embeds a random temp segment, so any path surviving into a response is
+  // visible as a leak without depending on the real username.
+  mkdirSync(STATE_DIR, { recursive: true });
+  const delivery = {
+    kind: "summary",
+    at: new Date().toISOString(),
+    summaryPath: join(STATE_DIR, "last-summary.md"),
+    summaryJsonPath: join(STATE_DIR, "last-summary.json"),
+    deliveryPath: join(STATE_DIR, "last-delivery.json"),
+    bytes: 4321,
+    excerpt: `# harness daily summary\n\n${DELIVERY_MARKER}`,
+  };
+  writeFileSync(LAST_DELIVERY_FILE, `${JSON.stringify(delivery, null, 2)}\n`);
+
+  // An ordinary event alongside it, so the delivery projection is measured
+  // next to the lastEvent projection rather than in place of it.
+  await post("/ingress/telegram", {
+    message: { text: "status probe", chat: { id: 5 }, from: { username: "probe-user" } },
+  });
+
+  const status = await getStatus();
+  assert.equal(status.raw.includes(STATE_DIR), false, "/status leaked STATE_DIR");
+  assert.equal(status.raw.includes(home), false, "/status leaked the fixture home");
+  assert.equal(status.raw.includes("last-summary.md"), false, "/status leaked summaryPath");
+  assert.equal(status.raw.includes("last-summary.json"), false, "/status leaked summaryJsonPath");
+  assert.equal(status.raw.includes("last-delivery.json"), false, "/status leaked deliveryPath");
+
+  const projected = status.json.lastDelivery;
+  assert.deepEqual(Object.keys(projected).sort(), ["at", "bytes", "excerpt", "kind"]);
+  assert.equal(projected.kind, "summary");
+  assert.equal(projected.at, delivery.at);
+  assert.equal(projected.bytes, 4321);
+  assert.match(projected.excerpt, /harness daily summary/);
+
+  // lastEvent's projection is unchanged by this change.
+  const event = status.json.lastEvent;
+  assert.equal(event.source, "telegram");
+  assert.equal(event.channel, "5");
+  assert.equal(event.sender, "probe-user");
+  assert.equal(event.text, "status probe");
+  assert.equal("body" in event, false);
+
+  // The stub pickup answers on the same unauthenticated surface, so it must not
+  // carry the path back either.
+  const pickup = await post("/chat", { text: "/summary" });
+  assert.deepEqual(Object.keys(pickup.lastSummary).sort(), ["at", "excerpt"]);
+  const pickupRaw = JSON.stringify(pickup);
+  assert.equal(pickupRaw.includes(STATE_DIR), false, "/chat pickup leaked STATE_DIR");
+  assert.equal(pickupRaw.includes("last-summary.md"), false, "/chat pickup leaked summaryPath");
+  assert.match(pickup.lastSummary.excerpt, /harness daily summary/);
+  detail = { projectionKeys: Object.keys(projected).sort() };
 } else if (mode === "burst") {
   // Case 3 + 6: 60 large events stay bounded and the count window still holds.
   for (let i = 0; i < 60; i++) {

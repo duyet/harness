@@ -11,6 +11,7 @@ import {
   resolveTask,
   gatewayBind,
   lastDelivery,
+  type LastDelivery,
 } from "./shared.ts";
 import { ingestErrorEvent, type IssueDraft } from "./issues.ts";
 import {
@@ -618,6 +619,24 @@ function projectEvent(event: IngressEvent | null): Record<string, unknown> | nul
   return projection;
 }
 
+// `/status` is unauthenticated here too, and the delivery record names three
+// absolute paths under the user's home (`summaryPath`, `summaryJsonPath`,
+// `deliveryPath`), each embedding the OS username. No HTTP consumer reads them
+// — `src/static/chat.html` reads `lastEvent` only — so the projection keeps
+// what identifies a delivery and its size, and drops the filesystem layout.
+// The excerpt is already capped at 600 characters on write. Operators who need
+// the paths read them locally via `harness gateway status --json` or
+// `harness summary --json`, which serve the file from disk.
+function projectDelivery(delivery: LastDelivery | null): Record<string, unknown> | null {
+  if (!delivery) return null;
+  return {
+    kind: delivery.kind,
+    at: delivery.at,
+    bytes: delivery.bytes,
+    excerpt: delivery.excerpt,
+  };
+}
+
 // `/ingress/sentry` and `/ingress/bugsink` are unauthenticated, so their 202
 // answers a projection the way `/status` does — never the draft. Returning the
 // whole draft re-served the entire stored payload, which for a large event is
@@ -669,7 +688,7 @@ export async function handleGatewayRequest(req: Request, bind: ReturnType<typeof
     if (reply.mode === "stub" && chatPickupRequested(parsed.body, url, result.task.text)) {
       const delivery = lastDelivery();
       body.lastSummary = delivery
-        ? { at: delivery.at, path: delivery.summaryPath, excerpt: delivery.excerpt }
+        ? { at: delivery.at, excerpt: delivery.excerpt }
         : null;
       if (delivery) {
         body.reply = `${reply.reply}\n\nlast summary (${delivery.at}):\n${delivery.excerpt}`;
@@ -684,7 +703,7 @@ export async function handleGatewayRequest(req: Request, bind: ReturnType<typeof
       version: VERSION,
       bind,
       lastEvent: projectEvent(lastIngress()),
-      lastDelivery: lastDelivery(),
+      lastDelivery: projectDelivery(lastDelivery()),
     });
   }
   if (req.method === "POST" && url.pathname === "/ingress/matrix") {

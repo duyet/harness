@@ -63,6 +63,13 @@ describe("gateway ingress state bounds (isolated, no sockets)", () => {
     expect(detail.marker).toBe("harness-ingress-marker-8f3a2b");
   });
 
+  test("/status projects lastDelivery and never echoes the delivery paths", () => {
+    // Same unauthenticated route as lastEvent: the projected delivery carries
+    // kind/at/bytes/excerpt and no path under STATE_DIR.
+    const detail = run("delivery");
+    expect(detail.projectionKeys).toEqual(["at", "bytes", "excerpt", "kind"]);
+  });
+
   test("sixty large events leave the queue under budget and last-ingress small", () => {
     const detail = run("burst");
     expect(detail.queueBytes).toBeLessThan(2 * 1024 * 1024);

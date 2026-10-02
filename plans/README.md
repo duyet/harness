@@ -144,7 +144,7 @@ Prefer **007** and **008** first (integrity + security). 009–011 may follow in
 | 014 | Cap the ingress event fields that plan 010 left unbounded | DONE | 010 |
 | 015 | Bound the Sentry/Bugsink draft path — payload size and directory growth | DONE | 002, 007 |
 | 016 | Rotate `harness pick` across the issue and freeform tiers | DONE | none |
-| 017 | Project `lastDelivery` on unauthenticated `GET /status` | OPEN | 010 |
+| 017 | Project `lastDelivery` on unauthenticated `GET /status` | DONE | 010 |
 | 018 | Make `executeCleanup` idempotent (failed tab-close must not wedge spawns) | OPEN | 006, 013 |
 | 019 | Write all harness state files atomically (temp + rename) | OPEN | none |
 | 020 | Refuse interactive stdin for `harness issues ingest` | OPEN | none |

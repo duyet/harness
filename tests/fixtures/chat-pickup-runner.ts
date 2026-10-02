@@ -38,19 +38,19 @@ if (mode === "pickup") {
   // Literal "/summary" text picks up the delivered report in the stub reply.
   const slash = await postChat({ text: "/summary" });
   assert.equal(slash.mode, "stub");
-  assert.equal(slash.lastSummary.path, LAST_SUMMARY_FILE);
+  assert.deepEqual(Object.keys(slash.lastSummary).sort(), ["at", "excerpt"]);
   assert.match(slash.lastSummary.excerpt, /harness daily summary/);
   assert.match(slash.reply, /last summary \(/);
   assert.match(slash.reply, /harness daily summary/);
   // Body flag works on any text.
   const flagged = await postChat({ text: "hello there", pickup: true });
   assert.equal(flagged.mode, "stub");
-  assert.equal(flagged.lastSummary.path, LAST_SUMMARY_FILE);
+  assert.deepEqual(Object.keys(flagged.lastSummary).sort(), ["at", "excerpt"]);
   assert.match(flagged.reply, /harness daily summary/);
   // Query flag works too.
   const queried = await postChat({ text: "hi" }, "?pickup=true");
   assert.equal(queried.mode, "stub");
-  assert.equal(queried.lastSummary.path, LAST_SUMMARY_FILE);
+  assert.deepEqual(Object.keys(queried.lastSummary).sort(), ["at", "excerpt"]);
   // Default path is unchanged: no pickup field, plain stub reply.
   const plain = await postChat({ text: "hello world" });
   assert.equal(plain.mode, "stub");
