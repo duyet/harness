@@ -14,6 +14,7 @@
     .msg { max-width:72ch; padding:10px 12px; border:1px solid var(--line); border-radius:10px; white-space:pre-wrap; }
     .user { align-self:flex-end; }
     .asst { align-self:flex-start; }
+    .msg.err { border-color:#7d2f2f; background:#1d1214; color:#ffb3b3; }
     form { display:flex; gap:8px; padding:12px 16px; border-top:1px solid var(--line); }
     input { flex:1; background:#161618; color:var(--fg); border:1px solid var(--line); border-radius:8px; padding:10px 12px; }
     button { background:var(--acc); color:#111; border:0; border-radius:8px; padding:10px 14px; font-weight:600; cursor:pointer; }
@@ -28,12 +29,22 @@
   </form>
   <script>
     const log = document.getElementById("log");
-    function add(role, text) {
+    function add(role, text, cls) {
       const d = document.createElement("div");
-      d.className = "msg " + (role === "user" ? "user" : "asst");
+      d.className = "msg " + (role === "user" ? "user" : "asst") + (cls ? " " + cls : "");
       d.textContent = text;
       log.appendChild(d);
       log.scrollTop = log.scrollHeight;
+      return d;
+    }
+    // A refusal that carries no JSON — `Bun.serve`'s bodiless 413 for a body
+    // over the 256 KB ceiling, or an HTML error page from something in front of
+    // the gateway — must never look like the assistant said nothing. Named for
+    // the status so the cause is visible in the transcript, and never silently
+    // swallowed: `r.json()` below is guarded the same way `refresh()` is.
+    function addError(r, detail) {
+      const status = r && r.status ? "HTTP " + r.status : "network error";
+      add("asst", "request failed: " + status + (detail ? " — " + detail : ""), "err");
     }
     async function refresh() {
       try {
@@ -57,12 +68,30 @@
       if (!text) return;
       input.value = "";
       add("user", text);
-      const r = await fetch("/chat", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ text }),
-      });
-      const j = await r.json();
+      let r;
+      try {
+        r = await fetch("/chat", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ text }),
+        });
+      } catch (e) {
+        addError(null, String(e));
+        return;
+      }
+      let j;
+      try {
+        j = await r.json();
+      } catch {
+        addError(r, r.ok ? "response was not JSON" : "no JSON body");
+        return;
+      }
+      if (!r.ok) {
+        // A well-formed error envelope is still an error, and it already says
+        // why in `error`; fall back to the raw body only if it did not.
+        addError(r, j && j.error ? j.error : JSON.stringify(j));
+        return;
+      }
       add("asst", j.reply || JSON.stringify(j));
       refresh();
     };

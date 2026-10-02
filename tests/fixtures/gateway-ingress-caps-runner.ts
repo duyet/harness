@@ -388,8 +388,10 @@ if (mode === "verbatim") {
 
   detail = { marker: MARKER, responseBytes: observed };
 } else if (mode === "content-length") {
-  // Case 7: a declared oversized body is refused with 413 before it is read,
-  // leaving the queue exactly as it was.
+  // Case 7: a declared oversized body reaches the handler's own refusal — the
+  // only path where the JSON envelope is real. `Bun.serve` answers first on a
+  // real server (plan 032); this is the direct call, and the queue is left
+  // exactly as it was either way.
   await post("/ingress/telegram", { message: { text: "first", chat: { id: 1 }, from: { username: "a" } } });
   const before = readFileSync(INGRESS_QUEUE_FILE, "utf8");
   const lastBefore = readFileSync(LAST_INGRESS_FILE, "utf8");
@@ -467,11 +469,14 @@ if (mode === "verbatim") {
   const CHUNKED_HEAD =
     "POST /ingress/telegram HTTP/1.1\r\nHost: localhost\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n";
 
-  // No Content-Length at all, above the ceiling: the handler's counted read is
-  // the only thing that can catch this. Modest oversize still gets the JSON
-  // envelope; a body far past the ceiling is one the server drops the
-  // connection on instead of answering, which is equally bounded and is pinned
-  // here so the difference is a characterized behavior rather than a surprise.
+  // No Content-Length at all, above the ceiling: `Bun.serve` cuts the body
+  // stream mid-read and answers a bare 413, so the handler's counted read never
+  // gets to answer with its own envelope. Plan 032 measured this across the
+  // oversize tiers — 1.02x, 1.5x and 3x all answer 413 with no body — and
+  // corrected `README.md`, which had promised the JSON envelope here. What
+  // matters to the bound is the status line and that nothing was written, so
+  // that is what is asserted; whether Bun pairs the 413 with a body is its
+  // business, and a client that parses one is relying on an accident.
   const oversized = await raw(CHUNKED_HEAD, chunked(JSON.stringify({
     message: { text: "big", chat: { id: 1 }, from: { username: oversizedSender() } },
   }).padEnd(REQUEST_MAX_BYTES * 2, "x")));

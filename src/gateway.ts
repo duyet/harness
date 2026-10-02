@@ -590,6 +590,16 @@ type ParsedBody =
   | { ok: true; body: Record<string, unknown> }
   | { ok: false; response: Response };
 
+// The handler's own refusal of its own ceiling. Note what this is *not*: on a
+// real `Bun.serve` with the matching `maxRequestBodySize`, this response does
+// not reach the wire. Bun refuses a declared oversize at the socket before the
+// handler is entered, and cuts the body stream of an undeclared one mid-read,
+// answering both with a bare 413 and no body at all — and discarding whatever
+// the handler would have returned. So this stays as the honest answer for the
+// two paths that do reach it: a direct call to `handleGatewayRequest` (which is
+// what the test fixtures make), and a future where the server ceiling is raised
+// above this one. `README.md` says so; a client must not parse the body of a
+// 413, because there usually is not one.
 function payloadTooLarge(): Response {
   return Response.json(
     { ok: false, error: `request body exceeds ${INGRESS_REQUEST_MAX_BYTES} bytes` },
@@ -661,10 +671,13 @@ function exceedsJsonDepth(value: unknown, maxDepth: number): boolean {
 // guarantee on its own: the Content-Length precheck here is a fast path that
 // refuses a truthful oversized request without reading it, the counted read
 // below is what actually bounds memory (a client may omit the header or lie
-// about it), and `Bun.serve`'s `maxRequestBodySize` rejects declared oversize
-// before the handler is entered at all. None of the three bounds depth — 80 KB
-// of 40,000 two-byte levels is well under the byte ceiling and still
-// serializes into a `RangeError` — so the walk above is the fourth.
+// about it), and `Bun.serve`'s `maxRequestBodySize` — the layer that actually
+// answers on a real server, before the handler is entered for a declared
+// oversize and mid-stream for an undeclared one — is the outer bound. The
+// first two are unreachable through `Bun.serve` as configured and are kept as
+// the handler's own contract; see `payloadTooLarge`. None of the three bounds
+// depth — 80 KB of 40,000 two-byte levels is well under the byte ceiling and
+// still serializes into a `RangeError` — so the walk above is the fourth.
 async function parseJsonObject(req: Request): Promise<ParsedBody> {
   const declared = Number(req.headers.get("content-length"));
   if (Number.isFinite(declared) && declared > INGRESS_REQUEST_MAX_BYTES) {
