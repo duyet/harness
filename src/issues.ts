@@ -234,6 +234,14 @@ export function writeIssueDraft(draft: IssueDraft): IssueDraft {
   if (typeof draft.fingerprint !== "string" || !draft.fingerprint) {
     throw new Error("issue draft fingerprint must be a non-empty string");
   }
+  // Plan 026: a `github-created` draft with no URL is unreadable as "published"
+  // by either once-only guard — they both key on the URL — so it reads as
+  // "never published" and a replay files a duplicate issue. Refusing it here
+  // makes the invariant hold at the one place that persists, rather than
+  // depending on every caller having parsed a URL out of `gh`'s output.
+  if (draft.status === "github-created" && typeof draft.githubIssueUrl !== "string") {
+    throw new Error("issue draft status github-created requires a githubIssueUrl");
+  }
   const path = draftPathFor(draft);
   mkdirSync(ISSUES_DIR, { recursive: true });
   const previous = readStoredDraft(path);
@@ -354,7 +362,10 @@ export type GhCreateOutcome = {
 
 // Publish a stored draft via `gh issue create`. On success the draft file is
 // rewritten with status "github-created" plus the issue URL/number; on any
-// failure the on-disk draft is left untouched.
+// failure the on-disk draft is left untouched. Success requires a URL parsed
+// out of `gh`'s stdout — an exit 0 we cannot identify is reported as a failure
+// and persisted as nothing, because the URL is what both once-only guards read
+// as proof of publication.
 export function publishIssueDraft(draft: IssueDraft, ghBin = "gh"): GhCreateOutcome {
   // A draft already published for this fingerprint must never file a second
   // issue: replay the recorded outcome without spawning `gh`.
@@ -385,7 +396,12 @@ export function publishIssueDraft(draft: IssueDraft, ghBin = "gh"): GhCreateOutc
     stdio: ["ignore", "pipe", "pipe"],
     killSignal: "SIGKILL",
   });
-  const stdout = (r.stdout || "").trim().slice(0, 500);
+  // Two different concerns, so two copies: the 500-char slice bounds what is
+  // *reported* in the outcome, while matching runs against the untruncated
+  // stdout, because a wrapper or a newer `gh` can print well past 500
+  // characters before the URL.
+  const fullStdout = (r.stdout || "").trim();
+  const stdout = fullStdout.slice(0, 500);
   const stderr = (r.stderr || "").trim().slice(0, 500);
   if (ghTimedOut(r)) {
     // A timeout means we do not know whether GitHub filed the issue, so the
@@ -434,12 +450,37 @@ export function publishIssueDraft(draft: IssueDraft, ghBin = "gh"): GhCreateOutc
       draft,
     };
   }
-  const url = stdout.match(/https:\/\/github\.com\/\S+\/issues\/(\d+)/)?.[0];
-  const issueNumber = url ? Number(url.split("/").pop()) : undefined;
+  // The host is not hardcoded to `github.com`: `gh` prints a GHES URL for GitHub
+  // Enterprise Server (`GH_HOST`, `gh auth login --hostname`), and that is just
+  // as good proof of publication. Anchored on `/issues/<n>`, so an ordinary
+  // `github.com` URL still matches exactly what it always did.
+  const match = fullStdout.match(/https:\/\/[^\s/]+\/[^\s]*\/issues\/(\d+)/);
+  if (!match) {
+    // `gh` exited 0, so the issue was filed — but we cannot identify it. Do NOT
+    // persist `github-created` here: both once-only guards key on the URL, so
+    // that state would read as "never published", the next ingest would spawn
+    // `gh` again, and a plain re-ingest would erase the record of the publish.
+    // Same conservative shape as the timeout branch above, with the opposite
+    // advice: the issue may exist, so say so instead of reporting success.
+    return {
+      ok: false,
+      command,
+      status: r.status,
+      stdout,
+      stderr,
+      error:
+        `gh issue create exited 0 but printed no recognisable issue URL, so the issue may have ` +
+        `been filed and cannot be linked to this draft; re-running risks a duplicate — check the ` +
+        `repository's issues before retrying`,
+      draft,
+    };
+  }
+  const url = match[0];
+  const issueNumber = Number(match[1]);
   const stored = writeIssueDraft({
     ...draft,
     status: "github-created",
-    ...(url ? { githubIssueUrl: url } : {}),
+    githubIssueUrl: url,
     ...(issueNumber != null ? { githubIssueNumber: issueNumber } : {}),
   });
   return { ok: true, command, status: r.status, stdout, stderr, url, issueNumber, draft: stored };

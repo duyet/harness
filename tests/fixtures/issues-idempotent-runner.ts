@@ -3,9 +3,15 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const [mode, home, cwd, event = "a"] = process.argv.slice(2);
+const [mode, home, cwd, event = "a", flavour = "plain"] = process.argv.slice(2);
 const MODES = new Set(["dry-run", "execute", "replay-direct", "replay-gateway"]);
+// What the recording `gh` prints on success. "plain" is the ordinary github.com
+// URL; the others are the shapes plan 026 covers — a GitHub Enterprise Server
+// host, a URL pushed past the 500-char reporting slice, and an exit 0 carrying
+// no URL at all.
+const FLAVOURS = new Set(["plain", "ghes", "long", "no-url"]);
 assert(MODES.has(mode), `bad mode: ${mode}`);
+assert(FLAVOURS.has(flavour), `bad flavour: ${flavour}`);
 assert(event === "a" || event === "b", `bad event: ${event}`);
 assert.equal(process.env.HOME, home);
 assert.equal(process.cwd(), cwd);
@@ -30,7 +36,12 @@ const n = calls.length;
 calls.push(args);
 writeFileSync(capture, JSON.stringify(calls));
 if (args[0] === "issue" && args[1] === "create") {
-  console.log("https://github.com/duyet/harness/issues/" + (42 + n));
+  const url = "https://github.com/duyet/harness/issues/" + (42 + n);
+  const flavour = ${JSON.stringify(flavour)};
+  if (flavour === "ghes") console.log(url.replace("github.com", "ghe.example.com"));
+  else if (flavour === "long") console.log("x".repeat(900) + "\\n" + url);
+  else if (flavour === "no-url") console.log("issue created");
+  else console.log(url);
   process.exit(0);
 }
 console.error("unexpected fixture-gh args: " + args.join(" "));

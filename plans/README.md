@@ -193,7 +193,7 @@ Prefer **007** and **008** first (integrity + security). 009–011 may follow in
 | 023 | Keep every issue draft inside the OS single-argument limit | OPEN | 015 |
 | 024 | Project the unauthenticated ingress POST responses | OPEN | 014, 015 |
 | 025 | Answer hostile input with the JSON envelope, not a 500 | OPEN | 004, 019 |
-| 026 | Never record `github-created` without a URL | OPEN | 007 |
+| 026 | Never record `github-created` without a URL | DONE — exit 0 with no parseable URL is now `ok: false` and persists nothing (the timeout branch's conservative shape), the recogniser is host-flexible and reads the untruncated stdout, and `writeIssueDraft` refuses a URL-less `github-created`. Both named triggers (GHES host, >500-char preamble) now take the ordinary successful path, so neither duplicates on replay nor is erased by a re-ingest | 007 |
 | 027 | Hold `/chat` summary pickup to the same bind check as execute | OPEN | 008, 017 |
 
 Status values: OPEN | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJECTED (with one-line rationale).

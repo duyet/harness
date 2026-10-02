@@ -4,7 +4,15 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const [mode, home, cwd] = process.argv.slice(2);
-const MODES = new Set(["mock", "created", "created-no-url", "fail", "no-gh"]);
+const MODES = new Set([
+  "mock",
+  "created",
+  "created-ghes",
+  "created-long-url",
+  "created-no-url",
+  "fail",
+  "no-gh",
+]);
 assert(MODES.has(mode), `bad mode: ${mode}`);
 assert.equal(process.env.HOME, home);
 assert.equal(process.cwd(), cwd);
@@ -41,7 +49,13 @@ const mode = ${JSON.stringify(mode)};
 if (mode === "fail") { console.error("gh: not logged in"); process.exit(4); }
 if (args[0] === "issue" && args[1] === "create") {
   if (mode === "created") console.log("https://github.com/duyet/harness/issues/42");
-  if (mode === "created-no-url") console.log("issue created");
+  // A GitHub Enterprise Server host: exit 0 and a real issue, on a URL the old
+  // github.com-only recogniser could not see.
+  if (mode === "created-ghes") console.log("https://ghe.example.com/duyet/harness/issues/42");
+  // A wrapper or a newer gh that writes past 500 characters before the URL, so
+  // the URL is sliced away long before anything matches it.
+  if (mode === "created-long-url") console.log("x".repeat(900) + "\\nhttps://github.com/duyet/harness/issues/42");
+  if (mode === "created-no-url") console.log("x".repeat(900) + "\\nissue created");
   process.exit(0);
 }
 console.error("unexpected fixture-gh args: " + args.join(" "));

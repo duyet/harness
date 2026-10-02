@@ -8,6 +8,7 @@ const EVENT_A = "idem-fixture-a";
 const EVENT_B = "idem-fixture-b";
 const URL_A = "https://github.com/duyet/harness/issues/42";
 const URL_B = "https://github.com/duyet/harness/issues/43";
+const GHES_URL_A = "https://ghe.example.com/duyet/harness/issues/42";
 
 let fixture: ReturnType<typeof createFixture>;
 
@@ -33,12 +34,15 @@ function ghCalls(): string[][] {
 }
 
 // Drive one CLI/gateway ingest through the fixture runner, which owns the
-// recording `gh` and the isolated PATH.
-function ingest(mode: string, event: "a" | "b" = "a") {
+// recording `gh` and the isolated PATH. `flavour` is what that `gh` prints on
+// success — "plain" github.com, a GHES host, a URL past the 500-char reporting
+// slice, or no URL at all.
+function ingest(mode: string, event: "a" | "b" = "a", flavour = "plain") {
   fixture.assertIsolation();
   const child = fixture.runCode(`
     process.argv = [process.execPath, ${JSON.stringify(RUNNER)}, ${JSON.stringify(mode)},
-      ${JSON.stringify(fixture.home)}, ${JSON.stringify(fixture.cwd)}, ${JSON.stringify(event)}];
+      ${JSON.stringify(fixture.home)}, ${JSON.stringify(fixture.cwd)}, ${JSON.stringify(event)},
+      ${JSON.stringify(flavour)}];
     await import(${JSON.stringify(RUNNER)});
   `);
   expect(child.stderr, `${mode}/${event}`).toBe("");
@@ -211,5 +215,98 @@ describe("issue ingest replay", () => {
       EVENT_A,
       EVENT_B,
     ]);
+  });
+});
+
+// Plan 026: `gh` exiting 0 does not mean the harness can identify the issue it
+// filed. Recording `github-created` without a URL reads as "never published" to
+// both once-only guards, so a replay files a duplicate and a plain re-ingest
+// erases the record. These pin both halves: the shapes that *are* identifiable
+// are published normally, and the one that is not is never recorded as
+// published at all.
+describe("issue publish identification", () => {
+  test("a GHES publish is recorded with its URL, and a re-ingest keeps it", () => {
+    const first = ingest("execute", "a", "ghes");
+    expect(first.exit).toBe(0);
+    expect(first.json).toMatchObject({
+      ok: true,
+      mode: "executed",
+      github: { status: 0, url: GHES_URL_A, issueNumber: 42 },
+    });
+    expect(storedDraft(EVENT_A)).toMatchObject({
+      status: "github-created",
+      githubIssueUrl: GHES_URL_A,
+      githubIssueNumber: 42,
+    });
+    expect(ghCalls()).toHaveLength(1);
+
+    // A plain re-ingest of the same event must not read the file as
+    // unpublished and rewrite it back to a mock draft.
+    const replay = ingest("replay-direct");
+    expect(replay.exit).toBe(0);
+    expect(replay.json.draft).toMatchObject({
+      status: "github-created",
+      githubIssueUrl: GHES_URL_A,
+    });
+    expect(storedDraft(EVENT_A)).toMatchObject({
+      status: "github-created",
+      githubIssueUrl: GHES_URL_A,
+    });
+    expect(ghCalls()).toHaveLength(1);
+  });
+
+  test("a URL past 500 chars of preamble is recorded, and a re-ingest keeps it", () => {
+    const first = ingest("execute", "a", "long");
+    expect(first.exit).toBe(0);
+    expect(first.json).toMatchObject({
+      ok: true,
+      mode: "executed",
+      github: { status: 0, url: URL_A, issueNumber: 42 },
+    });
+    expect(storedDraft(EVENT_A)).toMatchObject({
+      status: "github-created",
+      githubIssueUrl: URL_A,
+      githubIssueNumber: 42,
+    });
+    expect(ghCalls()).toHaveLength(1);
+
+    const replay = ingest("replay-gateway");
+    expect(replay.exit).toBe(0);
+    expect(replay.json.draft).toMatchObject({ status: "github-created", githubIssueUrl: URL_A });
+    expect(storedDraft(EVENT_A)).toMatchObject({
+      status: "github-created",
+      githubIssueUrl: URL_A,
+    });
+    expect(ghCalls()).toHaveLength(1);
+  });
+
+  test("an unidentifiable publish stays a mock draft and a replay does not file a second issue", () => {
+    const first = ingest("execute", "a", "no-url");
+    expect(first.exit).toBe(1);
+    expect(first.json.ok).toBe(false);
+    expect(first.json.mode).toBe("executed");
+    expect(first.json.github.status).toBe(0);
+    expect(first.json.github.error).toContain("printed no recognisable issue URL");
+    // Nothing on disk claims this event was published, because nothing on disk
+    // can name the issue that was.
+    const afterPublish = storedDraft(EVENT_A);
+    expect(afterPublish.status).toBe("mock-draft");
+    expect(afterPublish.githubIssueUrl).toBeUndefined();
+    expect(ghCalls()).toHaveLength(1);
+
+    // The same event delivered again, by both ingest paths: neither spawns a
+    // second `gh issue create` for it.
+    for (const mode of ["replay-direct", "replay-gateway"] as const) {
+      const replay = ingest(mode);
+      expect(replay.exit).toBe(0);
+      expect(replay.json.draft.status).toBe("mock-draft");
+      expect(storedDraft(EVENT_A).status).toBe("mock-draft");
+      expect(ghCalls()).toHaveLength(1);
+    }
+
+    // And it is still pickable, which is the honest state for a draft nobody
+    // can prove was published.
+    const picked = cliJson(["pick", "--json"]);
+    expect(picked).toMatchObject({ ok: true, kind: "issue", id: `issue:${EVENT_A}` });
   });
 });
