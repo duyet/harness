@@ -105,7 +105,7 @@ Prefer **007** and **008** first (integrity + security). 009–011 may follow in
 | 010 | Bound gateway ingress state growth; stop raw `/status` echo | DONE | 001, 004 |
 | 011 | Surface live spawns in `manager status` + recovery hints | DONE | 001, 006 |
 | 012 | Verify the gateway PID still belongs to a harness gateway | DONE | none |
-| 013 | Bound every Herdr subprocess with a timeout; stop shelling out on dry-run | OPEN | none |
+| 013 | Bound every Herdr subprocess with a timeout; stop shelling out on dry-run | DONE | none |
 | 014 | Cap the ingress event fields that plan 010 left unbounded | OPEN | 010 |
 | 015 | Bound the Sentry/Bugsink draft path — payload size and directory growth | OPEN | 002, 007 |
 | 016 | Rotate `harness pick` across the issue and freeform tiers | OPEN | none |

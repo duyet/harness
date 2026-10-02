@@ -89,6 +89,8 @@ Walk up from cwd for `.herdr-harness.json`, else `examples/minimal/.herdr-harnes
 
 Executed spawns persist minimal metadata (taskId → worktree path, workspace/tab/pane ids, agent name) in `~/.local/state/herdr-harness/spawns.json` for cleanup/replace. A task with a recorded spawn refuses a second `--execute`; pass `--replace` (cleanup then respawn) or `harness manager cleanup <taskId> --execute` first.
 
+Every `herdr` call is bounded by `HARNESS_HERDR_TIMEOUT_MS` (default 60000, clamped 1000–300000) with stdin closed off, so a wedged server socket, a subcommand waiting on a prompt or a hung daemon can never hang the CLI; on timeout the child is SIGKILLed and the step is reported as an ordinary failure with `timed out after Nms` in `stderr` (plus `timedOut: true`). A timeout never deletes a spawn record, so an interrupted spawn stays recoverable. A dry run now spawns nothing at all — the `--version` liveness probe is deferred until `--execute`, and the dry-run envelope reports `herdr: null` when the probe was skipped.
+
 ## Mock issues + pick/summary (on-demand)
 
 Playbook **`desk:sentry-issues`**. Ingest writes a local mock draft and never calls GitHub — **mock is the default**. Passing `--execute` additionally runs `gh issue create` (title/body/labels derived from the draft, minus the `mock` label) using the repo `gh` detects from your cwd; on success the draft is rewritten with `status: "github-created"` plus `githubIssueUrl`/`githubIssueNumber`. Any `gh` failure (missing binary, not authed, non-zero exit) exits 1 and keeps the mock draft on disk. The gateway ingress stays mock-only.
@@ -176,6 +178,7 @@ Three checks must all pass before a subprocess is spawned:
 | `HARNESS_CHAT_ALLOW_ORIGIN` | comma-separated `Origin` values allowed to execute (default empty) | |
 | `HARNESS_CHAT_TIMEOUT_MS` | `/chat` adapter timeout (default `10000`, clamped 100–60000) | |
 | `HARNESS_GH_TIMEOUT_MS` | `issues ingest --execute` `gh issue create` timeout (default `60000`, clamped 1000–300000) | |
+| `HARNESS_HERDR_TIMEOUT_MS` | every `herdr` call in `manager spawn` / `manager cleanup --execute`, including the `--version` liveness probe (default `60000`, clamped 1000–300000) | |
 | `HARNESS_MATRIX_TOKEN` | unused | Matrix client |
 | `HARNESS_MATRIX_HOMESERVER` | unused | Matrix client |
 | `HARNESS_TELEGRAM_BOT_TOKEN` | unused | Telegram bot |

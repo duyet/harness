@@ -95,7 +95,8 @@ describe("manager spawn child tab/agent", () => {
       ["herdr", ...tabArgs()],
       ["herdr", ...agentArgs()],
     ]);
-    expect(result.calls).toEqual([["--version"]]);
+    // Plan 013: a dry run spawns nothing, the --version probe included.
+    expect(result.calls).toEqual([]);
   });
 
   test("executed spawn runs worktree, tab create and agent start in order", () => {
@@ -248,7 +249,8 @@ describe("manager cleanup / replace", () => {
       ["herdr", "worktree", "remove", "--workspace", "w9"],
     ]);
     expect(result.json.previousSpawn).toMatchObject({ workspaceId: "w9" });
-    expect(result.calls).toEqual([["--version"]]);
+    // Plan 013: cleanup dry-run defers the probe too, so it spawns nothing.
+    expect(result.calls).toEqual([]);
     expect(readSpawns()["fixture-task"]).toMatchObject({ workspaceId: "w9" });
   });
 

@@ -10,7 +10,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn, spawnSync, type SpawnSyncReturns } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
   ROOT,
@@ -229,12 +229,57 @@ function herdrBin(): string {
   return process.env.HERDR_BIN_PATH || "herdr";
 }
 
+// Herdr's subprocess budget, deliberately separate from the chat and gh budgets
+// so the three can be tuned independently. Every step is a local
+// worktree/tab/agent operation, but `agent start` can be slow on a cold or
+// loaded machine, so the default matches the gh network write at 60s rather
+// than the chat budget's 10s.
+export const HERDR_TIMEOUT_ENV = "HARNESS_HERDR_TIMEOUT_MS";
+export const DEFAULT_HERDR_TIMEOUT_MS = 60_000;
+export const MIN_HERDR_TIMEOUT_MS = 1_000;
+export const MAX_HERDR_TIMEOUT_MS = 5 * 60_000;
+
+export function herdrTimeoutMs(): number {
+  const n = Number(process.env[HERDR_TIMEOUT_ENV]);
+  if (!Number.isFinite(n) || n <= 0) return DEFAULT_HERDR_TIMEOUT_MS;
+  return Math.min(Math.max(Math.floor(n), MIN_HERDR_TIMEOUT_MS), MAX_HERDR_TIMEOUT_MS);
+}
+
+// A bounded spawnSync that hits its timer reports ETIMEDOUT alongside the
+// killSignal we asked for; a wedged child that only surfaced as SIGKILL counts
+// too, since SIGKILL cannot be caught and escaped.
+function herdrTimedOut(r: SpawnSyncReturns<string>): boolean {
+  const code = (r.error as NodeJS.ErrnoException | undefined)?.code;
+  return code === "ETIMEDOUT" || r.signal === "SIGKILL";
+}
+
+// stdin is ignored so herdr can never block on a terminal question there is
+// nobody to answer, and SIGKILL so a wedged child actually dies.
+function herdrSpawnOptions(timeoutMs: number) {
+  return {
+    encoding: "utf8" as const,
+    timeout: timeoutMs,
+    stdio: ["ignore", "pipe", "pipe"] as ["ignore", "pipe", "pipe"],
+    killSignal: "SIGKILL" as const,
+  };
+}
+
 function herdrUsable(): { ok: boolean; reason: string; bin: string } {
   const bin = herdrBin();
   const sock =
     process.env.HERDR_SOCKET ||
     join(homedir(), ".config", "herdr", "herdr.sock");
-  const probe = spawnSync(bin, ["--version"], { encoding: "utf8" });
+  // Bounded like every other herdr call: a probe that hangs must still be able
+  // to say "not usable", which is exactly what it cannot do while wedged.
+  const timeoutMs = herdrTimeoutMs();
+  const probe = spawnSync(bin, ["--version"], herdrSpawnOptions(timeoutMs));
+  if (herdrTimedOut(probe)) {
+    return {
+      ok: false,
+      reason: `herdr binary not usable (${bin}): --version timed out after ${timeoutMs}ms`,
+      bin,
+    };
+  }
   if (probe.error || probe.status !== 0) {
     return {
       ok: false,
@@ -242,6 +287,10 @@ function herdrUsable(): { ok: boolean; reason: string; bin: string } {
       bin,
     };
   }
+  // Only proves a socket *file* exists: a socket left behind by a crashed
+  // herdr passes this gate and the next real call wedges. Bounding the
+  // subprocess is what makes that recoverable; fixing the socket semantics is
+  // deliberately out of scope.
   if (!existsSync(sock)) {
     return { ok: false, reason: `no herdr socket at ${sock}`, bin };
   }
@@ -417,15 +466,28 @@ type HerdrStep = {
   status: number | null;
   stdout: string;
   stderr: string;
+  // Optional and additive: `results` is printed verbatim into the JSON envelope
+  // and existing consumers read only the four fields above.
+  timedOut?: boolean;
 };
 
+// Every herdr call in the CLI goes through here, so bounding it bounds all of
+// them. A timeout is an ordinary step failure — status stays null, the caller's
+// existing "herdr ... failed" envelope and recovery hint handle it, and the
+// timeout detail is folded into stderr so the operator can see why.
 function runHerdr(herdrBin: string, args: string[]): HerdrStep {
-  const r = spawnSync(herdrBin, args, { encoding: "utf8" });
+  const timeoutMs = herdrTimeoutMs();
+  const r = spawnSync(herdrBin, args, herdrSpawnOptions(timeoutMs));
+  const timedOut = herdrTimedOut(r);
+  const stderr = (r.stderr || "").trim();
   return {
     command: [herdrBin, ...args],
     status: r.status,
     stdout: (r.stdout || "").trim(),
-    stderr: (r.stderr || "").trim(),
+    stderr: timedOut
+      ? `${stderr ? `${stderr}; ` : ""}herdr timed out after ${timeoutMs}ms and was killed`
+      : stderr,
+    ...(timedOut ? { timedOut: true } : {}),
   };
 }
 
@@ -523,7 +585,6 @@ function cmdManagerSpawn() {
   if (f.has("--cleanup")) return cmdManagerCleanup();
   const resolved = resolveTask(taskId);
   const intendedCommands = intendedSpawnCommands(resolved);
-  const herdr = herdrUsable();
   const record = taskId ? loadSpawns().spawns[taskId] : undefined;
 
   if (resolved.error) {
@@ -532,14 +593,21 @@ function cmdManagerSpawn() {
       mode: "dry-run",
       ...resolved,
       intendedCommands,
-      herdr,
+      // Probing here would mean a subprocess on a path that has already failed
+      // for a different reason; see the probe call below.
+      herdr: null,
       todo: ["fix task id / config before spawn"],
     });
     process.exit(1);
   }
 
-  if (!execute || !herdr.ok) {
-    const why = !execute
+  // The documented default is dry-run, so the liveness probe is deferred until
+  // `--execute` actually asks for herdr work. A wedged herdr must not be able to
+  // hang a command that was never going to touch it.
+  const herdr = execute ? herdrUsable() : null;
+
+  if (!execute || !herdr?.ok) {
+    const why = !execute || !herdr
       ? "default is dry-run; pass --execute to attempt herdr worktree create"
       : herdr.reason;
     printJson({
@@ -560,6 +628,7 @@ function cmdManagerSpawn() {
         : {}),
       todo: [
         "Pass --execute when a live Herdr socket is available",
+        "Herdr is not probed on a dry run; the --version probe is deferred until --execute",
         ...(record
           ? [`existing spawn recorded for ${taskId}; pass --replace to respawn or --cleanup to remove`]
           : []),
@@ -699,12 +768,13 @@ function cmdManagerCleanup() {
     process.exit(1);
   }
   const resolved = resolveTask(taskId);
-  const herdr = herdrUsable();
   const record = loadSpawns().spawns[taskId];
   const cleanupPlan = intendedCleanupCommands(record, force);
+  // Deferred until --execute, for the same reason as in cmdManagerSpawn.
+  const herdr = execute ? herdrUsable() : null;
 
-  if (!execute || !herdr.ok) {
-    const why = !execute
+  if (!execute || !herdr?.ok) {
+    const why = !execute || !herdr
       ? "default is dry-run; pass --execute to run cleanup"
       : herdr.reason;
     printJson({

@@ -32,7 +32,9 @@ function run(mode: string) {
   const json = JSON.parse(child.stdout);
   const calls = JSON.parse(readFileSync(join(fixture.root, "manager-calls.json"), "utf8"));
   expect(existsSync(join(fixture.root, "worktree"))).toBe(false);
-  if (json.mode === "dry-run") {
+  // A dry-run envelope reports `herdr: null` when the probe was deferred (plan
+  // 013); an envelope that did probe still names the fixture binary.
+  if (json.herdr != null) {
     expect(json.herdr.bin).toBe(join(fixture.root, "bin", "fixture-herdr"));
   }
   return { ...child, json, calls };
@@ -79,7 +81,7 @@ describe("manager spawn exit status", () => {
   test("default dry-run never executes the worktree command", () => {
     const result = run("dry-run");
     expect(result.exit).toBe(0);
-    expect(result.json).toMatchObject({ ok: true, mode: "dry-run", herdr: { ok: true } });
+    expect(result.json).toMatchObject({ ok: true, mode: "dry-run", herdr: null });
     expect(result.json.skippedExecute).toContain("default is dry-run");
     expect(result.json.intendedCommands).toEqual([
       ["herdr", ...worktreeArgs()],
@@ -87,7 +89,9 @@ describe("manager spawn exit status", () => {
       ["herdr", ...agentArgs()],
     ]);
     expect(result.json.results).toBeUndefined();
-    expect(result.calls).toEqual([["--version"]]);
+    // Plan 013: the liveness probe is deferred until --execute, so a dry run
+    // spawns nothing at all — not even `herdr --version`.
+    expect(result.calls).toEqual([]);
   });
 
   test("unavailable Herdr with --execute falls back to successful dry-run", () => {
@@ -110,7 +114,8 @@ describe("manager spawn exit status", () => {
     expect(result.json).toMatchObject({ ok: false, mode: "dry-run", error: "unknown task: unknown-task" });
     expect(result.json.intendedCommands).toEqual([]);
     expect(result.json.results).toBeUndefined();
-    expect(result.calls).toEqual([["--version"]]);
+    // An unresolvable task short-circuits before the probe, so nothing spawns.
+    expect(result.calls).toEqual([]);
   });
 
   test("nonzero child status yields ok:false JSON and CLI exit one", () => {

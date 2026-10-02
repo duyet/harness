@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spyOn } from "bun:test";
 
-const [mode, home, cwd] = process.argv.slice(2);
+const [mode, home, cwd, timeoutEnv] = process.argv.slice(2);
 const MODES = new Set([
   "success",
   "nonzero",
@@ -23,6 +23,12 @@ const MODES = new Set([
   "cleanup-none",
   "spawn-cleanup-flag",
   "anyr",
+  // Plan 013: wedged-herdr modes. Each records its pid, then never returns, so
+  // only the harness timeout can free the CLI.
+  "hang-version",
+  "hang-worktree",
+  "hang-tab",
+  "hang-cleanup",
 ]);
 assert(MODES.has(mode), `bad mode: ${mode}`);
 assert.equal(process.env.HOME, home);
@@ -31,6 +37,7 @@ const root = dirname(home);
 const capture = join(root, "manager-calls.json");
 const bin = join(root, "bin");
 const herdr = join(bin, "fixture-herdr");
+const pidFile = join(root, "herdr-pid.txt");
 const socket = join(root, "fixture.sock");
 const wtPath = join(root, "worktree");
 const label = "harness:fixture-task";
@@ -42,6 +49,7 @@ writeFileSync(socket, "fixture only; not a socket\n");
 writeFileSync(herdr, `#!${process.execPath}
 import { readFileSync, writeFileSync } from "node:fs";
 const capture = ${JSON.stringify(capture)};
+const pidFile = ${JSON.stringify(pidFile)};
 const args = process.argv.slice(2);
 const calls = JSON.parse(readFileSync(capture, "utf8"));
 calls.push(args);
@@ -52,8 +60,15 @@ const label = ${JSON.stringify(label)};
 const cwd = ${JSON.stringify(cwd)};
 const out = (result) => { console.log(JSON.stringify({ id: "fixture", result })); };
 const fail = () => { console.log("fixture stdout"); console.error("fixture stderr"); process.exit(7); };
+// Records this pid so the test can assert the timed-out child is really gone,
+// then never returns. Only the hang modes below ever call it.
+const hang = async () => {
+  writeFileSync(pidFile, String(process.pid));
+  await new Promise(() => {});
+};
 const populated = ["cleanup", "cleanup-dry", "cleanup-force", "replace", "spawn-cleanup-flag"].includes(mode);
 if (args.length === 1 && args[0] === "--version") {
+  if (mode === "hang-version") await hang();
   console.log("fixture version");
   process.exit(mode === "unavailable" ? 1 : 0);
 }
@@ -62,6 +77,7 @@ if (a0 === "worktree" && a1 === "create") {
   if (mode === "null") { console.log("fixture stdout"); console.error("fixture stderr"); process.kill(process.pid, "SIGTERM"); }
   if (mode === "nonzero") fail();
   if (mode === "exists") { console.error("error: worktree already exists"); process.exit(3); }
+  if (mode === "hang-worktree") await hang();
   out({
     type: "worktree_created",
     workspace: { workspace_id: "w1", number: 2, label, focused: false, pane_count: 1, tab_count: 1, active_tab_id: "w1:t1", agent_status: "idle" },
@@ -73,6 +89,7 @@ if (a0 === "worktree" && a1 === "create") {
 }
 if (a0 === "tab" && a1 === "create") {
   if (mode === "fail-tab") fail();
+  if (mode === "hang-tab") await hang();
   out({
     type: "tab_created",
     tab: { tab_id: "w1:t2", workspace_id: "w1", number: 2, label, focused: false, pane_count: 1, agent_status: "idle" },
@@ -91,6 +108,7 @@ if (a0 === "pane" && a1 === "run") {
   process.exit(0);
 }
 if (a0 === "tab" && a1 === "list") {
+  if (mode === "hang-cleanup") await hang();
   out({
     type: "tab_list",
     tabs: populated
@@ -119,6 +137,8 @@ process.exit(2);
 `, { mode: 0o755 });
 process.env.HERDR_BIN_PATH = herdr;
 process.env.HERDR_SOCKET = socket;
+// Plan 013: seeds HARNESS_HERDR_TIMEOUT_MS; empty means "leave it unset".
+if (timeoutEnv) process.env.HARNESS_HERDR_TIMEOUT_MS = timeoutEnv;
 // No system executables are reachable through PATH, including a background gateway's bun.
 process.env.PATH = bin;
 function unexpected(name: string): never {
@@ -128,7 +148,7 @@ spyOn(Bun, "serve").mockImplementation(() => unexpected("Bun.serve"));
 spyOn(globalThis, "fetch").mockImplementation(() => unexpected("fetch"));
 const { STATE_DIR } = await import("../../src/shared.ts");
 assert.equal(STATE_DIR, join(home, ".local", "state", "herdr-harness"));
-const SEEDED = new Set(["pre-spawned", "replace", "cleanup", "cleanup-dry", "cleanup-force", "spawn-cleanup-flag"]);
+const SEEDED = new Set(["pre-spawned", "replace", "cleanup", "cleanup-dry", "cleanup-force", "spawn-cleanup-flag", "hang-cleanup"]);
 if (SEEDED.has(mode)) {
   mkdirSync(STATE_DIR, { recursive: true });
   writeFileSync(
@@ -162,6 +182,7 @@ const cliArgs = (() => {
       return ["manager", "spawn", taskId];
     case "cleanup":
     case "cleanup-none":
+    case "hang-cleanup":
       return ["manager", "cleanup", taskId, "--execute"];
     case "cleanup-dry":
       return ["manager", "cleanup", taskId];
