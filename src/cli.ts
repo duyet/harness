@@ -504,9 +504,63 @@ function herdrResult(step: HerdrStep): Record<string, any> | null {
   return null;
 }
 
+// Rows of a `tab list` / `worktree list` envelope, or null when the step did not
+// succeed or the payload is not a list. Callers must never read a null as "empty":
+// a wedged herdr and a quiet one are different states, and only the quiet one can
+// prove that a cleanup already happened.
+function readableList(step: HerdrStep, key: "tabs" | "worktrees"): any[] | null {
+  if (step.status !== 0) return null;
+  const rows = herdrResult(step)?.[key];
+  return Array.isArray(rows) ? rows : null;
+}
+
+// Tab ids a listing still reports for this task, or null when it could not be read.
+function taskTabIds(
+  step: HerdrStep,
+  record: SpawnRecord | undefined,
+  label: string,
+): string[] | null {
+  const tabs = readableList(step, "tabs");
+  if (!tabs) return null;
+  return tabs
+    .filter((t: any) => t?.tab_id === record?.tabId || t?.label === label)
+    .map((t: any) => t.tab_id)
+    .filter((id: any) => typeof id === "string");
+}
+
+// The worktree entry this task still owns, or null when none is listed (or the
+// listing could not be read) — see taskTabIds for why those share a result.
+function taskWorktree(
+  step: HerdrStep,
+  record: SpawnRecord | undefined,
+  wt: Record<string, any>,
+  wtLabel: string,
+): any | null {
+  const worktrees = readableList(step, "worktrees");
+  if (!worktrees) return null;
+  return (
+    worktrees.find(
+      (w: any) =>
+        w?.open_workspace_id === record?.workspaceId ||
+        w?.path === record?.worktreePath ||
+        (wt.path && w?.path === wt.path) ||
+        w?.label === wtLabel,
+    ) ?? null
+  );
+}
+
 // Ordered cleanup: list → close matching tab(s) → remove the worktree's
 // workspace. Presence comes from live discovery; the persisted spawn record
 // only supplies extra match hints and a fallback workspace id.
+//
+// `ok` answers "is the desired end state true now", never "did every command
+// exit 0". A tab the user (or an earlier cleanup) already closed makes
+// `tab close` exit nonzero even though the goal is met, and treating that as a
+// failure pins the record in spawns.json forever: `manager spawn` then refuses
+// with "task already spawned" and `--replace` dies at "cleanup before
+// re-spawn failed". When a step does not confirm its own effect, re-listing is
+// what distinguishes already-gone from still-there without also swallowing a
+// genuine failure.
 function executeCleanup(
   taskId: string,
   resolved: ResolvedTask | null,
@@ -526,30 +580,22 @@ function executeCleanup(
   if (tabsStep.status !== 0 || wtStep.status !== 0) {
     return { ok: false, error: "herdr discovery failed; not safe to clean up", results };
   }
-  const tabs = herdrResult(tabsStep)?.tabs;
-  const worktrees = herdrResult(wtStep)?.worktrees;
-  if (!Array.isArray(tabs) || !Array.isArray(worktrees)) {
+  const worktrees = readableList(wtStep, "worktrees");
+  if (!readableList(tabsStep, "tabs") || !worktrees) {
     return { ok: false, error: "could not parse herdr list output", results };
   }
 
-  const tabIds = tabs
-    .filter((t: any) => t?.tab_id === record?.tabId || t?.label === label)
-    .map((t: any) => t.tab_id)
-    .filter((id: any) => typeof id === "string");
-  const wtMatch = worktrees.find(
-    (w: any) =>
-      w?.open_workspace_id === record?.workspaceId ||
-      w?.path === record?.worktreePath ||
-      (wt.path && w?.path === wt.path) ||
-      w?.label === wtLabel,
-  );
+  const tabIds = taskTabIds(tabsStep, record, label)!;
+  const wtMatch = taskWorktree(wtStep, record, wt, wtLabel);
   const workspaceId = wtMatch?.open_workspace_id ?? record?.workspaceId ?? null;
 
   const closedTabs: string[] = [];
+  let undecided = false;
   for (const tabId of tabIds) {
     const r = runHerdr(herdr.bin, ["tab", "close", tabId]);
     results.push(r);
     if (r.status === 0) closedTabs.push(tabId);
+    else undecided = true;
   }
   let removedWorkspace: string | null = null;
   if (workspaceId) {
@@ -562,9 +608,25 @@ function executeCleanup(
     ]);
     results.push(r);
     if (r.status === 0) removedWorkspace = workspaceId;
+    else undecided = true;
   }
 
-  const ok = results.every((r) => r.status === 0);
+  // Every step exited 0, so each one already proved its own effect: a closed tab
+  // is gone and a removed workspace is not listed. Only a step that failed to
+  // confirm needs the world asked about it.
+  let ok = !undecided;
+  if (undecided) {
+    const afterTabs = runHerdr(herdr.bin, ["tab", "list"]);
+    results.push(afterTabs);
+    const afterWorktrees = runHerdr(herdr.bin, ["worktree", "list", "--cwd", process.cwd()]);
+    results.push(afterWorktrees);
+    // A null listing fails this check rather than passing it: an unreadable list
+    // is not an empty one, and an unconfirmed cleanup keeps its record.
+    ok =
+      taskTabIds(afterTabs, record, label)?.length === 0 &&
+      readableList(afterWorktrees, "worktrees") !== null &&
+      taskWorktree(afterWorktrees, record, wt, wtLabel) === null;
+  }
   if (ok) deleteSpawn(taskId);
   return {
     ok,
