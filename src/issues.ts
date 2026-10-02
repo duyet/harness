@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { spawnSync } from "node:child_process";
+import { spawnSync, type SpawnSyncReturns } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { ISSUES_DIR, PLAYBOOK_SENTRY } from "./shared.ts";
@@ -180,6 +180,28 @@ export function ghIssueCreateArgv(draft: IssueDraft): string[] {
   ];
 }
 
+// Publishing is a network write, so it gets a larger budget than a chat
+// adapter. The env name stays distinct from HARNESS_CHAT_TIMEOUT_MS so the two
+// subprocess budgets can be tuned separately.
+export const GH_TIMEOUT_ENV = "HARNESS_GH_TIMEOUT_MS";
+export const DEFAULT_GH_TIMEOUT_MS = 60_000;
+export const MIN_GH_TIMEOUT_MS = 1_000;
+export const MAX_GH_TIMEOUT_MS = 5 * 60_000;
+
+export function ghTimeoutMs(): number {
+  const n = Number(process.env[GH_TIMEOUT_ENV]);
+  if (!Number.isFinite(n) || n <= 0) return DEFAULT_GH_TIMEOUT_MS;
+  return Math.min(Math.max(Math.floor(n), MIN_GH_TIMEOUT_MS), MAX_GH_TIMEOUT_MS);
+}
+
+// A bounded spawnSync that hits its timer reports ETIMEDOUT alongside the
+// killSignal we asked for; a wedged child that only surfaced as SIGKILL counts
+// too, since SIGKILL cannot be caught and escaped.
+function ghTimedOut(r: SpawnSyncReturns<string>): boolean {
+  const code = (r.error as NodeJS.ErrnoException | undefined)?.code;
+  return code === "ETIMEDOUT" || r.signal === "SIGKILL";
+}
+
 export type GhCreateOutcome = {
   ok: boolean;
   command: string[];
@@ -214,9 +236,34 @@ export function publishIssueDraft(draft: IssueDraft, ghBin = "gh"): GhCreateOutc
   }
   const args = ghIssueCreateArgv(draft);
   const command = [ghBin, ...args];
-  const r = spawnSync(ghBin, args, { encoding: "utf8", cwd: process.cwd() });
+  const timeoutMs = ghTimeoutMs();
+  const r = spawnSync(ghBin, args, {
+    encoding: "utf8",
+    // `gh` resolves the target repo from the git remote of cwd; unchanged.
+    cwd: process.cwd(),
+    timeout: timeoutMs,
+    // stdin is ignored so `gh` can never block on a terminal question there is
+    // nobody to answer, and SIGKILL so a wedged child actually dies.
+    stdio: ["ignore", "pipe", "pipe"],
+    killSignal: "SIGKILL",
+  });
   const stdout = (r.stdout || "").trim().slice(0, 500);
   const stderr = (r.stderr || "").trim().slice(0, 500);
+  if (ghTimedOut(r)) {
+    // A timeout means we do not know whether GitHub filed the issue, so the
+    // failure path stays conservative: the draft on disk keeps its
+    // mock-draft status and re-running is safe.
+    return {
+      ok: false,
+      command,
+      status: r.status,
+      stdout,
+      stderr,
+      error:
+        `gh issue create timed out after ${timeoutMs}ms; it may or may not have been filed, so re-running is safe`,
+      draft,
+    };
+  }
   if (r.error || r.status !== 0) {
     return {
       ok: false,

@@ -132,11 +132,20 @@ Add `tests/issues-gh-timeout.test.ts` plus `tests/fixtures/issues-gh-timeout-run
 
 ## Done criteria
 
-- [ ] Focused and full Bun suites exit 0.
-- [ ] A `gh` that never returns cannot hang the CLI; it is killed and reported as a timeout.
-- [ ] Success, nonzero-exit and missing-binary envelopes are byte-compatible with today's.
-- [ ] `gh` can never block waiting on terminal input.
-- [ ] `HARNESS_GH_TIMEOUT_MS` is clamped and documented; `git diff --check` passes; file scope respected; index row updated.
+- [x] Focused and full Bun suites exit 0.
+- [x] A `gh` that never returns cannot hang the CLI; it is killed and reported as a timeout.
+- [x] Success, nonzero-exit and missing-binary envelopes are byte-compatible with today's.
+- [x] `gh` can never block waiting on terminal input.
+- [x] `HARNESS_GH_TIMEOUT_MS` is clamped and documented; `git diff --check` passes; file scope respected; index row updated.
+
+## Implementation notes (2026-10-02)
+
+Implemented at `58995c7`+1 on top of plan 007's duplicate guard, which sits directly above the `spawnSync` call and leaves the argv untouched.
+
+- Clamp floor is **1000 ms** (max 300000 ms, default 60000 ms). Step 3 suggests exercising the hang with `HARNESS_GH_TIMEOUT_MS=300`, which the floor would raise to 1000 ms; the test uses the floor instead and covers the `300 → 1000` clamp as a unit case.
+- No `timedOut` field was added to `GhCreateOutcome`. Step 2 permits one only "if the CLI prints it", and `src/cli.ts` is outside this plan's file scope — the existing envelope already surfaces the message through `github.error`.
+- On Bun 1.4.2 `spawnSync`'s *default* stdio already hands the child an EOF'd stdin, so the explicit `stdio: ["ignore", "pipe", "pipe"]` pins a guarantee that is currently incidental rather than fixing a live hang on this version. The stdin test is written as an invariant (the fixture `gh` reads stdin to EOF and must return on its own) and says so.
+- Timeout detection keys on `r.error.code === "ETIMEDOUT" || r.signal === "SIGKILL"`; the `SIGKILL` arm covers a child that surfaced only the signal. Verified against Bun 1.4.2: `status: null`, `signal: "SIGKILL"`, and the child genuinely reaped.
 
 ## STOP conditions
 

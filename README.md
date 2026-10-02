@@ -43,7 +43,7 @@ cat examples/herdr-config-ctrl-g.toml                       # the Ctrl+G snippet
 | `harness gateway start` | Background localhost HTTP + chat UI (`http://127.0.0.1:8787/`) |
 | `harness gateway status` | Listening?, pid, bind, lastEvent, lastDelivery |
 | `harness gateway stop` | Stop by pid file |
-| `harness issues ingest --source sentry\|bugsink` | Mock GH issue draft from JSON stdin/`--file` (no GitHub API); `--execute` also runs a real `gh issue create` |
+| `harness issues ingest --source sentry\|bugsink` | Mock GH issue draft from JSON stdin/`--file` (no GitHub API); `--execute` also runs a real `gh issue create`, bounded by a timeout (default 60s, `HARNESS_GH_TIMEOUT_MS`) |
 | `harness issues list` | Drafts under `~/.local/state/herdr-harness/issues/` |
 | `harness pick` | Next work: mock issue drafts (severity-ordered) → named tasks → freeform queue |
 | `harness summary` | On-demand markdown report (`--json` ok). **No cron.** `--deliver`/`--write` also writes `last-summary.md`/`.json` + `last-delivery.json` under the state dir |
@@ -92,6 +92,8 @@ Executed spawns persist minimal metadata (taskId → worktree path, workspace/ta
 ## Mock issues + pick/summary (on-demand)
 
 Playbook **`desk:sentry-issues`**. Ingest writes a local mock draft and never calls GitHub — **mock is the default**. Passing `--execute` additionally runs `gh issue create` (title/body/labels derived from the draft, minus the `mock` label) using the repo `gh` detects from your cwd; on success the draft is rewritten with `status: "github-created"` plus `githubIssueUrl`/`githubIssueNumber`. Any `gh` failure (missing binary, not authed, non-zero exit) exits 1 and keeps the mock draft on disk. The gateway ingress stays mock-only.
+
+The `gh` call is bounded: it gets at most `HARNESS_GH_TIMEOUT_MS` (default 60000, clamped 1000–300000) with stdin closed off, so a stalled network or a wedged `gh` can never hang the CLI. On timeout it is SIGKILLed and the envelope reports `timed out after Nms` — the draft stays `mock-draft`, because a timeout cannot tell you whether GitHub filed it, and re-running is safe.
 
 ```bash
 echo '{"event_id":"abc","project":"harness","message":"TypeError: boom","culprit":"src/cli.ts","level":"error"}' \
@@ -171,6 +173,7 @@ Three checks must all pass before a subprocess is spawned:
 | `HARNESS_CHAT_ALLOW_REMOTE` | `1`/`true`/`yes`/`on` allows execute on a non-loopback bind | |
 | `HARNESS_CHAT_ALLOW_ORIGIN` | comma-separated `Origin` values allowed to execute (default empty) | |
 | `HARNESS_CHAT_TIMEOUT_MS` | `/chat` adapter timeout (default `10000`, clamped 100–60000) | |
+| `HARNESS_GH_TIMEOUT_MS` | `issues ingest --execute` `gh issue create` timeout (default `60000`, clamped 1000–300000) | |
 | `HARNESS_MATRIX_TOKEN` | unused | Matrix client |
 | `HARNESS_MATRIX_HOMESERVER` | unused | Matrix client |
 | `HARNESS_TELEGRAM_BOT_TOKEN` | unused | Telegram bot |
