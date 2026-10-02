@@ -140,12 +140,12 @@ Add `tests/issues-idempotent.test.ts` with the six cases above and `tests/fixtur
 
 ## Done criteria
 
-- [ ] Focused and full Bun suites exit 0.
-- [ ] A replayed event never issues a second `gh issue create`.
-- [ ] A replayed event never resets `github-created` back to `mock-draft`; recorded URL/number survive.
-- [ ] A published draft never reappears as `kind: "issue"` in `harness pick`.
-- [ ] First-time drafts keep their exact filenames, labels, `gh` argv and dry-run envelope (plan 002 and plan 004 regressions hold).
-- [ ] `git diff --check` passes; file scope respected; index row updated.
+- [x] Focused and full Bun suites exit 0.
+- [x] A replayed event never issues a second `gh issue create`.
+- [x] A replayed event never resets `github-created` back to `mock-draft`; recorded URL/number survive.
+- [x] A published draft never reappears as `kind: "issue"` in `harness pick`.
+- [x] First-time drafts keep their exact filenames, labels, `gh` argv and dry-run envelope (plan 002 and plan 004 regressions hold).
+- [x] `git diff --check` passes; file scope respected; index row updated.
 
 ## STOP conditions
 

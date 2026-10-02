@@ -103,6 +103,31 @@ function draftPathFor(draft: IssueDraft): string {
   return path;
 }
 
+function readStoredDraft(path: string): Record<string, unknown> | null {
+  if (!existsSync(path)) return null;
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+    return isRecord(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+// An upstream replay of the same event re-normalizes to a fresh mock draft, but
+// the draft file is the record of what was actually filed. Once it is
+// published, the published fields and the original createdAt are carried over
+// from the stored copy and only volatile fields (title/body/labels/raw) are
+// refreshed from the inbound payload.
+function mergePublishedState(draft: IssueDraft, stored: IssueDraft): IssueDraft {
+  return {
+    ...draft,
+    status: "github-created",
+    githubIssueUrl: stored.githubIssueUrl,
+    ...(stored.githubIssueNumber != null ? { githubIssueNumber: stored.githubIssueNumber } : {}),
+    createdAt: stored.createdAt,
+  };
+}
+
 export function writeIssueDraft(draft: IssueDraft): IssueDraft {
   if (draft.source !== "sentry" && draft.source !== "bugsink") {
     throw new Error(`invalid issue source: ${String(draft.source)}`);
@@ -112,7 +137,12 @@ export function writeIssueDraft(draft: IssueDraft): IssueDraft {
   }
   const path = draftPathFor(draft);
   mkdirSync(ISSUES_DIR, { recursive: true });
-  const stored = { ...draft, path };
+  const previous = readStoredDraft(path);
+  const effective =
+    previous && previous.status === "github-created" && typeof previous.githubIssueUrl === "string"
+      ? mergePublishedState(draft, previous as unknown as IssueDraft)
+      : draft;
+  const stored = { ...effective, path };
   writeFileSync(path, `${JSON.stringify(stored, null, 2)}\n`);
   return stored;
 }
@@ -159,6 +189,7 @@ export type GhCreateOutcome = {
   error?: string;
   url?: string;
   issueNumber?: number;
+  skipped?: "already-published";
   draft: IssueDraft;
 };
 
@@ -166,6 +197,21 @@ export type GhCreateOutcome = {
 // rewritten with status "github-created" plus the issue URL/number; on any
 // failure the on-disk draft is left untouched.
 export function publishIssueDraft(draft: IssueDraft, ghBin = "gh"): GhCreateOutcome {
+  // A draft already published for this fingerprint must never file a second
+  // issue: replay the recorded outcome without spawning `gh`.
+  if (draft.status === "github-created" && draft.githubIssueUrl) {
+    return {
+      ok: true,
+      command: [],
+      status: null,
+      stdout: "",
+      stderr: "",
+      url: draft.githubIssueUrl,
+      ...(draft.githubIssueNumber != null ? { issueNumber: draft.githubIssueNumber } : {}),
+      skipped: "already-published",
+      draft,
+    };
+  }
   const args = ghIssueCreateArgv(draft);
   const command = [ghBin, ...args];
   const r = spawnSync(ghBin, args, { encoding: "utf8", cwd: process.cwd() });
