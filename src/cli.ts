@@ -9,7 +9,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { spawn, spawnSync, type SpawnSyncReturns } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
@@ -516,16 +516,83 @@ function readableList(step: HerdrStep, key: "tabs" | "worktrees"): any[] | null 
   return Array.isArray(rows) ? rows : null;
 }
 
+// Is `path` `parent`, or somewhere under it? Both sides are resolved first so a
+// trailing separator or a `..` segment cannot smuggle a foreign path through.
+function sameTree(path: string, parent: string): boolean {
+  const a = resolve(path);
+  const b = resolve(parent);
+  return a === b || a.startsWith(b.endsWith(sep) ? b : b + sep);
+}
+
+// Is this spawn record some other checkout's? spawns.json is one global file
+// keyed by a bare taskId, so "alpha" means *this* repo's task to an operator and
+// "whatever repo wrote last" to the file. Tearing down a record we do not own
+// closes that repo's tab and removes its worktree while still reporting ok, so
+// ownership is decided before any herdr call is made.
+//
+// The test is mutual containment rather than the one-way "record under cwd": a
+// record written from the repo root and a CLI run from a subdirectory of it are
+// the same tree, and refusing that would break the ordinary case. A record with a
+// missing, relative or empty cwd cannot be placed at all, and an unplaceable
+// record is one we must not destroy on another repository's behalf.
+function recordIsForeign(record: SpawnRecord | undefined): boolean {
+  if (!record) return false;
+  const recordCwd = typeof record.cwd === "string" ? record.cwd : "";
+  if (!recordCwd || !isAbsolute(recordCwd)) return true;
+  return !(sameTree(recordCwd, process.cwd()) || sameTree(process.cwd(), recordCwd));
+}
+
+// Refuse a foreign record, naming both paths so the operator knows which
+// repository to re-run from. Placed ahead of the herdr probe, not after it: the
+// probe is itself a herdr subprocess, and this gate exists to guarantee that a
+// foreign record runs nothing at all.
+function refuseForeignRecord(
+  taskId: string,
+  record: SpawnRecord | undefined,
+  mode: "executed" | "dry-run",
+): void {
+  if (!recordIsForeign(record)) return;
+  const from = record!.cwd || null;
+  printJson({
+    ok: false,
+    mode,
+    taskId,
+    error: "refusing to clean up a spawn recorded in another repository",
+    // Both paths in the envelope: `recordCwd` is the tree that has to be torn
+    // down, `cwd` is the one this command was actually run in.
+    recordCwd: from,
+    cwd: process.cwd(),
+    previousSpawn: record,
+    hint: from
+      ? `cd ${from} and re-run \`harness manager cleanup ${taskId} --execute\` (or \`harness manager spawn ${taskId} --replace\`) from that repository`
+      : `the record for ${taskId} has no cwd, so it cannot be matched to a repository; remove its worktree from Herdr directly or delete the record from spawns.json`,
+  });
+  process.exit(1);
+}
+
 // Tab ids a listing still reports for this task, or null when it could not be read.
+//
+// `label` is `harness:<taskId>`, which is unique per task but *not* per
+// repository, and `tab list` is global. Matching on it alone lets a repo-B
+// cleanup close repo A's tab whenever both define the same task id, so the
+// label arm only fires inside a workspace this cleanup owns. An explicit
+// `tabId` from the record stays ungated: it names one tab, and tab ids are
+// workspace-scoped (`w18:t1`), so a stale one matches nothing rather than a
+// neighbour's tab.
 function taskTabIds(
   step: HerdrStep,
   record: SpawnRecord | undefined,
   label: string,
+  workspaceId: string | null,
 ): string[] | null {
   const tabs = readableList(step, "tabs");
   if (!tabs) return null;
   return tabs
-    .filter((t: any) => t?.tab_id === record?.tabId || t?.label === label)
+    .filter(
+      (t: any) =>
+        t?.tab_id === record?.tabId ||
+        (workspaceId != null && t?.label === label && t?.workspace_id === workspaceId),
+    )
     .map((t: any) => t.tab_id)
     .filter((id: any) => typeof id === "string");
 }
@@ -587,9 +654,14 @@ function executeCleanup(
     return { ok: false, error: "could not parse herdr list output", results };
   }
 
-  const tabIds = taskTabIds(tabsStep, record, label)!;
+  // The workspace is resolved before the tab match because it is what scopes
+  // that match: the worktree listing is repo-scoped, so `open_workspace_id` is
+  // the one workspace id in this row that provably belongs to this repository.
+  // The same value then settles the re-list below — recomputing it after
+  // `worktree remove` would change the question the re-list is asking.
   const wtMatch = taskWorktree(wtStep, record, wt, wtLabel);
   const workspaceId = wtMatch?.open_workspace_id ?? record?.workspaceId ?? null;
+  const tabIds = taskTabIds(tabsStep, record, label, workspaceId)!;
 
   const closedTabs: string[] = [];
   let undecided = false;
@@ -625,7 +697,7 @@ function executeCleanup(
     // A null listing fails this check rather than passing it: an unreadable list
     // is not an empty one, and an unconfirmed cleanup keeps its record.
     ok =
-      taskTabIds(afterTabs, record, label)?.length === 0 &&
+      taskTabIds(afterTabs, record, label, workspaceId)?.length === 0 &&
       readableList(afterWorktrees, "worktrees") !== null &&
       taskWorktree(afterWorktrees, record, wt, wtLabel) === null;
   }
@@ -664,6 +736,13 @@ function cmdManagerSpawn() {
     });
     process.exit(1);
   }
+
+  // A record from another checkout is refused here, before the probe below:
+  // `--replace` is the documented recovery for "task already spawned", and
+  // following that hint from the wrong repository tears down the other one's
+  // worktree. Without `--replace` this record is inert — the refusal further
+  // down is the correct answer, and it names the record.
+  if (replace) refuseForeignRecord(taskId!, record, execute ? "executed" : "dry-run");
 
   // The documented default is dry-run, so the liveness probe is deferred until
   // `--execute` actually asks for herdr work. A wedged herdr must not be able to
@@ -834,6 +913,10 @@ function cmdManagerCleanup() {
   const resolved = resolveTask(taskId);
   const record = loadSpawns().spawns[taskId];
   const cleanupPlan = intendedCleanupCommands(record, force);
+  // Same gate as `--replace` in cmdManagerSpawn: `manager cleanup <id>` is the
+  // other documented recovery path, and it reaches the same tab close and
+  // worktree remove.
+  refuseForeignRecord(taskId, record, execute ? "executed" : "dry-run");
   // Deferred until --execute, for the same reason as in cmdManagerSpawn.
   const herdr = execute ? herdrUsable() : null;
 
