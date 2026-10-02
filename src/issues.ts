@@ -18,9 +18,12 @@ export type IssueDraft = {
   githubIssueNumber?: number;
   path?: string;
   raw?: unknown;
-  // Set only when the stored payload was cut at ISSUE_PAYLOAD_MAX_BYTES. An
-  // ordinary draft carries neither, so its serialized shape is unchanged; a
-  // draft written before the cap existed simply lacks them.
+  // Set only when the body was cut at ISSUE_PAYLOAD_MAX_BYTES. An ordinary
+  // draft carries neither, so its serialized shape is unchanged; a draft
+  // written before the cap existed simply lacks them. `bodyBytes` is the size
+  // of the payload actually embedded in `body`, not the size of the event it
+  // came from — the pair describes what the draft kept, which is what a reader
+  // of the body needs to know.
   bodyTruncated?: boolean;
   bodyBytes?: number;
   // Reported on the copy `writeIssueDraft` returns, never written to the file:
@@ -78,17 +81,38 @@ function buildDraft(
   // events that share a prefix must not collapse onto one fingerprint and lose
   // a real report.
   const fingerprint = fingerprintFor(raw);
+  // ...but it is capped where it enters the *body*, at the same bound as the
+  // lines above. `fingerprintFor` returns a caller-supplied `event_id` /
+  // `eventId` / `id` verbatim, and 200 KB of one puts the body past the OS
+  // single-argv limit on its own, with the whole event still inside the payload
+  // cap and so never looking oversized to an operator.
+  //
+  // Capped here rather than inside `fingerprintFor` on purpose: `draft.fingerprint`
+  // is the draft's identity — it keys `storageKeyFor`, and plan 007's replay
+  // guard matches on it — so the whole id still reaches storage and two long
+  // ids sharing a 500-char prefix cannot collapse onto one draft. Only the copy
+  // that `gh issue create` would carry as an argument is bounded.
+  const fingerprintLine = capHeader(fingerprint);
   const createdAt = new Date().toISOString();
   const title = `[${source}] ${project}: ${message}`.slice(0, 120);
 
+  // The cap is measured against the string that actually reaches the body, not
+  // against a different serialization of the same object. Below the cap the
+  // block is pretty-printed, which for a payload of many small keys runs two to
+  // three times the compact form — so a ~52 KB event passed the cap as compact
+  // JSON and then overflowed the argv limit once indented, with no truncation
+  // flag to say so. Serialize once, cut that string, and derive the flag from
+  // the cut rather than from the guess that picked the form.
   const serialized = JSON.stringify(raw);
-  const payloadBytes = Buffer.byteLength(serialized, "utf8");
-  const truncated = payloadBytes > ISSUE_PAYLOAD_MAX_BYTES;
+  const serializedBytes = Buffer.byteLength(serialized, "utf8");
   // Below the cap nothing changes at all — same pretty-printed block, same
   // stored object. Above it the block holds a prefix of the serialized event,
   // embedded verbatim rather than re-stringified: re-encoding the prefix would
   // escape it and could inflate it back past the cap.
-  const payload = truncated ? bytePrefix(serialized, ISSUE_PAYLOAD_MAX_BYTES) : JSON.stringify(raw, null, 2);
+  const embedded = serializedBytes > ISSUE_PAYLOAD_MAX_BYTES ? serialized : JSON.stringify(raw, null, 2);
+  const payload = bytePrefix(embedded, ISSUE_PAYLOAD_MAX_BYTES);
+  const payloadBytes = Buffer.byteLength(payload, "utf8");
+  const truncated = payload.length !== embedded.length;
 
   const body = [
     `Playbook: ${PLAYBOOK_SENTRY}`,
@@ -96,7 +120,7 @@ function buildDraft(
     `Project: ${project}`,
     `Level: ${level}`,
     culprit ? `Culprit: ${culprit}` : null,
-    `Fingerprint: ${fingerprint}`,
+    `Fingerprint: ${fingerprintLine}`,
     "",
     "```json",
     payload,
@@ -316,9 +340,9 @@ export const MAX_GH_TIMEOUT_MS = 5 * 60_000;
 // OS limit on a single argument, because `gh issue create` takes the whole body
 // as one argv element and Linux caps that at MAX_ARG_STRLEN (32 pages = 128
 // KiB); measured here, posix_spawn returns E2BIG at about 131 KB. 96 KiB plus
-// the draft's ~200 bytes of header leaves roughly 32 KB of margin, so a draft
-// inside the cap is always publishable. Anything larger is cut rather than
-// dropped, and the cut is visible on the draft.
+// the header — four capped lines and the fence, ~2 KB — leaves roughly 30 KB of
+// margin, so a draft inside the cap is always publishable. Anything larger is
+// cut rather than dropped, and the cut is visible on the draft.
 const ISSUE_PAYLOAD_MAX_BYTES = 96 * 1024;
 // Real `Project`/`Level`/`Culprit` values are tens of characters; the title is
 // already sliced to 120. Without this a caller could make the header alone
@@ -432,8 +456,9 @@ export function publishIssueDraft(draft: IssueDraft, ghBin = "gh"): GhCreateOutc
       error:
         `gh issue create argument list too long (E2BIG): the issue body is ${bodyBytes} bytes, ` +
         `past the OS limit on a single argument (~128 KiB on Linux). Draft payloads are capped at ` +
-        `${ISSUE_PAYLOAD_MAX_BYTES} bytes, so this is a draft stored before that cap — re-ingest the ` +
-        `event to rebuild it, or shorten the body.`,
+        `${ISSUE_PAYLOAD_MAX_BYTES} bytes and header values at ${ISSUE_HEADER_MAX_CHARS} chars, so a ` +
+        `draft written through these paths cannot reach this — it was stored before those bounds. ` +
+        `Re-ingest the event to rebuild it inside them.`,
       draft,
     };
   }

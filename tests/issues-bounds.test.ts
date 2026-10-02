@@ -52,6 +52,26 @@ describe("issue draft payload bounds", () => {
     expect(detail.storedBytes as number).toBeLessThan((detail.serializedBytes as number) * 0.5);
   });
 
+  test("every draft shape stays publishable, not just the ones the fixture wrote", () => {
+    const detail = run("bounded-body");
+    // One gh call per shape: each reached the binary and was accepted, rather
+    // than failing to spawn on an argument list past the OS limit.
+    expect(detail.ghCalls).toBe(4);
+    const bodies = detail.bodies as Record<string, number>;
+    expect(Object.keys(bodies).sort()).toEqual([
+      "oversized-eventId",
+      "oversized-event_id",
+      "oversized-id",
+      "wide-structured",
+    ]);
+    for (const [name, bytes] of Object.entries(bodies)) {
+      expect(bytes, `${name} body is ${bytes} bytes`).toBeLessThan(128 * 1024);
+    }
+    // The shapes that used to break are the ones that stay wide: an oversized
+    // id in any of the three keys, and a payload the indent alone inflates.
+    expect(Math.max(...Object.values(bodies))).toBeGreaterThan(96 * 1024);
+  });
+
   test("a missing gh still reports gh not usable, not an argument-limit failure", () => {
     const detail = run("gh-missing");
     expect(String(detail.error)).toContain("gh not usable (gh)");

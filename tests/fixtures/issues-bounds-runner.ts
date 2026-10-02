@@ -1,4 +1,5 @@
 import { strict as assert } from "node:assert";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,7 +9,8 @@ import { fileURLToPath } from "node:url";
 // GitHub call, never the network.
 const [mode, home, cwd] = process.argv.slice(2);
 const MODES = new Set([
-  "verbatim", "idempotent", "oversized", "count-bound", "byte-bound", "gh-missing", "gateway-202",
+  "verbatim", "idempotent", "oversized", "bounded-body", "count-bound", "byte-bound", "gh-missing",
+  "gateway-202",
 ]);
 assert(MODES.has(mode), `bad mode: ${mode}`);
 assert.equal(process.env.HOME, home);
@@ -16,6 +18,10 @@ assert.equal(process.cwd(), cwd);
 
 // Mirrors of the budgets in src/issues.ts; keep the two in step.
 const PAYLOAD_MAX_BYTES = 96 * 1024;
+const HEADER_MAX_CHARS = 500;
+// posix_spawn refuses an argv element this long, which is what makes the cap a
+// publishability bound rather than merely a storage bound.
+const ARGV_MAX_BYTES = 128 * 1024;
 const DIR_MAX_DRAFTS = 200;
 const DIR_MAX_BYTES = 16 * 1024 * 1024;
 // Finding either marker anywhere in a response or a stored draft means the
@@ -40,6 +46,40 @@ function bigEvent(id: string, fillerKb: number) {
     stack: `${"x".repeat(fillerKb * 1024)}${MARKER}${TAIL}`,
   };
 }
+
+// An oversized identifier in each of the three keys `fingerprintFor` reads, and
+// a payload whose 2-space indent inflates it several-fold past the cap while its
+// compact form stays inside it. The first shape used to write a 303 KB body and
+// the last a 170 KB one that carried no truncation flag at all.
+const ID_KEYS = ["event_id", "eventId", "id"] as const;
+function oversizedId(key: (typeof ID_KEYS)[number]) {
+  // The key name prefixes the id so the three shapes stay distinct drafts: an
+  // identical id would make them one, and plan 007's published-once guard would
+  // (correctly) refuse to spawn `gh` for the second and third.
+  return {
+    [key]: `bound-${key}-${"Z".repeat(200 * 1024)}`,
+    project: "harness",
+    message: "TypeError: boom",
+    level: "error",
+  };
+}
+function wideEvent(id: string) {
+  return {
+    event_id: id,
+    project: "harness",
+    message: "TypeError: boom",
+    crumbs: Array.from({ length: 6554 }, () => ({ a: 1 })),
+  };
+}
+
+const sha256 = (value: string) => createHash("sha256").update(value, "utf8").digest("hex");
+
+// The bodies plan 023 found and left alone, captured at `b661b4e`: a short
+// ordinary event, and one carrying a long flat `stack`. Both are below the cap
+// under every bound this plan adds, so they must not move by a byte. Recorded
+// as digests because the second is 8 KB of filler.
+const ORDINARY_BODY_SHA256 = "b624a74e1f96fe054c34643d505ca05f1658f75db81f80bdd8e37ce30e8ea971";
+const FLAT_STACK_BODY_SHA256 = "c9c4ffffbf2f8a126ac6af0f9cb9eeb9aaddc3395e9d593c7bfe68d80c8fc469";
 
 function draftFiles() {
   if (!existsSync(ISSUES_DIR)) return [];
@@ -158,7 +198,10 @@ if (mode === "verbatim") {
 
   const draft = ingestErrorEvent("sentry", event);
   assert.equal(draft.bodyTruncated, true);
-  assert.equal(draft.bodyBytes, serializedBytes);
+  // The number describes what the draft kept — the bytes embedded in the body —
+  // not the size of the event it was cut from. Both are worth knowing; only this
+  // one is what `bodyBytes` means.
+  assert.equal(draft.bodyBytes, PAYLOAD_MAX_BYTES);
   // The stored raw is a prefix, inside the bound, with the tail cut off.
   assert.equal(typeof draft.raw, "string");
   assert(Buffer.byteLength(draft.raw as string, "utf8") <= PAYLOAD_MAX_BYTES, "stored raw over budget");
@@ -170,7 +213,7 @@ if (mode === "verbatim") {
   // The argv body is bounded too — this is what `gh` could not accept before.
   const spec = githubIssueSpec(draft);
   const bodyBytes = Buffer.byteLength(spec.body, "utf8");
-  assert(bodyBytes < 128 * 1024, `issue body ${bodyBytes} is past the single-argv limit`);
+  assert(bodyBytes < ARGV_MAX_BYTES, `issue body ${bodyBytes} is past the single-argv limit`);
   const ghBody = ghIssueCreateArgv(draft)[ghIssueCreateArgv(draft).indexOf("--body") + 1]!;
   assert.equal(ghBody, spec.body);
   assert.equal(spec.title, draft.title);
@@ -209,6 +252,75 @@ if (mode === "verbatim") {
   assert(storedBytes <= 2 * PAYLOAD_MAX_BYTES + 8 * 1024, `draft file is ${storedBytes} bytes`);
   assert(storedBytes < serializedBytes, "the stored draft should be smaller than the event");
   detail = { serializedBytes, bodyBytes, storedBytes };
+} else if (mode === "bounded-body") {
+  // Case 4: the body fits the OS single-argv limit for *every* shape, asserted
+  // as a property over a table rather than as one more fixture — so the next
+  // field added to the header cannot silently reopen the hole. The first three
+  // shapes are an oversized id in each key `fingerprintFor` reads; the last is
+  // the payload that only the 2-space indent inflates past the cap.
+  const { ingestErrorEvent, publishIssueDraft, githubIssueSpec } = await import("../../src/issues.ts");
+
+  const shapes: { name: string; event: Record<string, unknown>; bigId: boolean }[] = [
+    ...ID_KEYS.map((key) => ({ name: `oversized-${key}`, event: oversizedId(key), bigId: true })),
+    { name: "wide-structured", event: wideEvent("bound-wide-1"), bigId: false },
+  ];
+  const bodies: Record<string, number> = {};
+  for (const shape of shapes) {
+    // The fixture must reproduce the hole, or the property below is vacuous.
+    const compactBytes = Buffer.byteLength(JSON.stringify(shape.event), "utf8");
+    assert(compactBytes > 32 * 1024, `${shape.name}: fixture is too small to be a test`);
+
+    const draft = ingestErrorEvent("sentry", shape.event);
+    const bodyBytes = Buffer.byteLength(draft.body, "utf8");
+    assert(bodyBytes < ARGV_MAX_BYTES, `${shape.name}: body is ${bodyBytes} bytes`);
+    bodies[shape.name] = bodyBytes;
+
+    // A cut body says so, and the number is the size of what was embedded.
+    assert.equal(draft.bodyTruncated, true, `${shape.name}: the cut is not visible on the draft`);
+    assert.equal(typeof draft.raw, "string", `${shape.name}: the cut raw should be the embedded prefix`);
+    assert.equal(draft.bodyBytes, Buffer.byteLength(draft.raw as string, "utf8"));
+    assert(draft.body.includes(draft.raw as string), `${shape.name}: raw is not the embedded prefix`);
+    // And the whole body is that payload plus a bounded header, so the header
+    // can never be what pushes it over.
+    assert(bodyBytes <= PAYLOAD_MAX_BYTES + 4 * (HEADER_MAX_CHARS + 32), `${shape.name}: header is unbounded`);
+
+    // The fingerprint line is bounded, and shows the cut rather than hiding it.
+    const fpLine = draft.body.split("\n").find((l) => l.startsWith("Fingerprint: "))!;
+    assert(fpLine.length <= "Fingerprint: ".length + HEADER_MAX_CHARS + 1, `${shape.name}: ${fpLine.length} chars`);
+    assert.equal(fpLine.endsWith("…"), shape.bigId, `${shape.name}: the cut should be visible`);
+    // Identity is still the whole id: the body is bounded, the draft is not.
+    assert.equal(draft.fingerprint, shape.event.event_id ?? shape.event.eventId ?? shape.event.id);
+    assert.equal(draft.id, draft.fingerprint);
+
+    // And it publishes: `gh` is reached, accepts the argv, and files the issue.
+    const published = publishIssueDraft(draft);
+    assert.equal(published.ok, true, `${shape.name}: ${published.error}`);
+    assert.equal(published.status, 0);
+    assert(published.url!.startsWith("https://github.com/duyet/harness/issues/"));
+    assert.equal(published.draft.status, "github-created");
+    // The recorded call is the argv `gh` actually received, not our own count.
+    const calls = JSON.parse(readFileSync(capture, "utf8")) as { bodyBytes: number }[];
+    assert.equal(calls.length, shapes.indexOf(shape) + 1, `${shape.name}: gh was not reached`);
+    assert(calls[calls.length - 1].bodyBytes < ARGV_MAX_BYTES, `${shape.name}: argv body too long`);
+    // The body `gh` is handed is rebuilt from the stored draft rather than
+    // reused, so the bound has to hold on the rebuild too — and it differs from
+    // the stored body only by the source note the publish path rewrites.
+    const specBody = githubIssueSpec(draft).body;
+    assert.equal(specBody, draft.body.split("mock — GitHub API not called").join("created via gh issue create"));
+    assert(Buffer.byteLength(specBody, "utf8") < ARGV_MAX_BYTES, `${shape.name}: rebuilt body too long`);
+  }
+
+  // Ordinary drafts are byte-identical to before the bounds landed, or an
+  // ordinary alert would read differently for no reason. Hashed rather than
+  // spelled out: one is a short event, the other carries an 8 KB stack.
+  const ordinary = { event_id: "bound-ordinary-1", project: "harness", message: "TypeError: boom", level: "error" };
+  assert.equal(sha256(ingestErrorEvent("sentry", ordinary).body), ORDINARY_BODY_SHA256);
+  assert.equal(sha256(ingestErrorEvent("sentry", bigEvent("bound-flat-1", 8)).body), FLAT_STACK_BODY_SHA256);
+  // Neither carries the flags, so an ordinary draft's serialized shape is
+  // unchanged too.
+  assert.equal("bodyTruncated" in ingestErrorEvent("sentry", ordinary), false);
+
+  detail = { bodies, ghCalls: JSON.parse(readFileSync(capture, "utf8")).length };
 } else if (mode === "count-bound" || mode === "byte-bound") {
   // Cases 4 + 5: the directory stays inside its budget under sustained ingest,
   // evicting oldest `mock-draft` drafts only, and a `github-created` draft
@@ -309,7 +421,7 @@ if (mode === "verbatim") {
   assert.equal(body.draft.status, "mock-draft");
   assert.equal(body.draft.path, join(ISSUES_DIR, "sentry-bound-gateway-1.json"));
   assert.equal(body.draft.bodyTruncated, true);
-  assert.equal(body.draft.bodyBytes, serializedBytes);
+  assert.equal(body.draft.bodyBytes, PAYLOAD_MAX_BYTES);
   // The projection never carries the payload itself.
   assert.equal("raw" in body.draft, false);
   assert.equal("body" in body.draft, false);
@@ -333,6 +445,29 @@ if (mode === "verbatim") {
   // at 2 MB wrote 8.4 MB before this cap existed.
   const storedBytes = statSync(body.draft.path).size;
   assert(storedBytes <= 2 * PAYLOAD_MAX_BYTES + 8 * 1024, `draft file is ${storedBytes} bytes`);
+
+  // The second hole, reached the same unauthenticated way: a payload whose
+  // compact form is inside the cap but whose 2-space-indented form is not. This
+  // used to answer 202 with a ~170 KB draft carrying no truncation flag, so
+  // nothing anywhere said the body could not be published.
+  const wide = wideEvent("bound-gateway-wide");
+  const wideCompact = Buffer.byteLength(JSON.stringify(wide), "utf8");
+  const widePretty = Buffer.byteLength(JSON.stringify(wide, null, 2), "utf8");
+  assert(wideCompact < PAYLOAD_MAX_BYTES, "wide fixture must be inside the cap as compact JSON");
+  assert(widePretty > ARGV_MAX_BYTES, "wide fixture must overflow the argv limit once indented");
+  assert(wideCompact < 256 * 1024, "wide fixture must stay reachable through the request ceiling");
+
+  const wideResponse = await send("/ingress/sentry", wide);
+  assert.equal(wideResponse.status, 202);
+  const wideBody = JSON.parse(await wideResponse.text());
+  assert.equal(wideBody.draft.fingerprint, "bound-gateway-wide");
+  assert.equal(wideBody.draft.bodyTruncated, true, "the cut must be visible in the 202");
+  assert.equal(wideBody.draft.bodyBytes, PAYLOAD_MAX_BYTES);
+  assert.equal("body" in wideBody.draft, false);
+  const wideDraft = readDraft("sentry-bound-gateway-wide.json");
+  const wideBodyBytes = Buffer.byteLength(wideDraft.body, "utf8");
+  assert(wideBodyBytes < ARGV_MAX_BYTES, `wide draft body is ${wideBodyBytes} bytes`);
+  assert.equal(Buffer.byteLength(wideDraft.raw as string, "utf8"), PAYLOAD_MAX_BYTES);
 
   detail = { responseBytes, storedBytes, serializedBytes };
 } else {
