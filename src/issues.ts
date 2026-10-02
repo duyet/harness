@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { ISSUES_DIR, PLAYBOOK_SENTRY } from "./shared.ts";
+import { ISSUES_DIR, PLAYBOOK_SENTRY, writeJsonAtomic } from "./shared.ts";
 
 export type IssueDraft = {
   id: string;
@@ -242,7 +242,10 @@ export function writeIssueDraft(draft: IssueDraft): IssueDraft {
       ? mergePublishedState(draft, previous as unknown as IssueDraft)
       : draft;
   const stored = { ...effective, path };
-  writeFileSync(path, `${JSON.stringify(stored, null, 2)}\n`);
+  // Atomic because `readStoredDraft` is what plan 007's published-once guard
+  // stands on: a torn draft parses as no draft, and "no draft" reads as
+  // "never published", which is how one incident becomes two GitHub issues.
+  writeJsonAtomic(path, stored);
   // Trimmed after the write, so the new draft is counted and is the one kept.
   // The eviction list rides on the returned copy only — the file on disk never
   // carries it, so `listIssueDrafts` cannot read one draft's eviction as

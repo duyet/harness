@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, renameSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import {
   VERSION,
@@ -11,6 +11,7 @@ import {
   resolveTask,
   gatewayBind,
   lastDelivery,
+  writeJsonAtomic,
   type LastDelivery,
 } from "./shared.ts";
 import { ingestErrorEvent, type IssueDraft } from "./issues.ts";
@@ -115,15 +116,6 @@ function readJsonFile<T>(path: string, fallback: T): T {
   }
 }
 
-// Both state files are rewritten on every request. Writing to a sibling temp
-// file and renaming means a crash mid-write can never leave half a JSON
-// document behind — same directory, so the rename stays within one filesystem.
-function writeJsonAtomic(path: string, value: unknown) {
-  const tmp = `${path}.${process.pid}.tmp`;
-  writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`);
-  renameSync(tmp, path);
-}
-
 // Above the cap the stored body becomes a prefix of the caller's serialized
 // payload. Trimming the parsed object instead would have to guess which keys
 // matter, and could yield a structure that still parses as real data.
@@ -193,6 +185,9 @@ function trimQueue(queue: IngressEvent[]): IngressEvent[] {
   return kept.reverse();
 }
 
+// Both files are rewritten on every request, so they go through the shared
+// atomic writer — the crash-safety reasoning lives with the helper in
+// shared.ts now that every state writer uses it.
 function persistIngress(event: IngressEvent) {
   mkdirSync(STATE_DIR, { recursive: true });
   writeJsonAtomic(LAST_INGRESS_FILE, event);
@@ -748,10 +743,11 @@ export function startGatewayServer() {
     },
   });
   mkdirSync(STATE_DIR, { recursive: true });
-  writeFileSync(
-    GATEWAY_META_FILE,
-    `${JSON.stringify({ pid: process.pid, bind: { hostname: server.hostname, port: server.port }, version: VERSION }, null, 2)}\n`,
-  );
+  writeJsonAtomic(GATEWAY_META_FILE, {
+    pid: process.pid,
+    bind: { hostname: server.hostname, port: server.port },
+    version: VERSION,
+  });
   console.error(`harness gateway listening on http://${server.hostname}:${server.port}`);
   return server;
 }

@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -115,9 +115,43 @@ export function loadState(): State {
   }
 }
 
+// Every durable state file is rewritten in place, and every reader here
+// silently falls back to an empty value when the bytes do not parse — so a
+// write torn by a crash is not a small cosmetic problem. A half-written
+// `spawns.json` reads as an empty map, and `manager spawn` answers that by
+// creating a second worktree for a task that is already live; a half-written
+// issue draft reads as no draft, which is exactly the "not published yet"
+// state plan 007's once-only guard depends on.
+//
+// So: write a sibling temp file, then rename over the target. Readers see
+// either the old bytes or the new ones, never a prefix. The temp file is a
+// sibling by construction, so the rename stays inside one filesystem and does
+// not degrade into a non-atomic copy.
+export function writeFileAtomic(path: string, contents: string) {
+  const tmp = `${path}.${process.pid}.tmp`;
+  try {
+    writeFileSync(tmp, contents);
+    renameSync(tmp, path);
+  } catch (e) {
+    // A failed write must not leave an orphan beside the real file: the state
+    // directory is small and long-lived, and a stale `.tmp` is indistinguishable
+    // from a live writer's scratch file.
+    try {
+      unlinkSync(tmp);
+    } catch {
+      /* the write failed before the temp file existed; nothing to clean up */
+    }
+    throw e;
+  }
+}
+
+export function writeJsonAtomic(path: string, value: unknown) {
+  writeFileAtomic(path, `${JSON.stringify(value, null, 2)}\n`);
+}
+
 export function saveState(state: State) {
   mkdirSync(STATE_DIR, { recursive: true });
-  writeFileSync(STATE_FILE, `${JSON.stringify(state, null, 2)}\n`);
+  writeJsonAtomic(STATE_FILE, state);
 }
 
 export type SpawnRecord = {
@@ -146,7 +180,7 @@ export function loadSpawns(): SpawnsState {
 
 export function saveSpawns(state: SpawnsState) {
   mkdirSync(STATE_DIR, { recursive: true });
-  writeFileSync(SPAWNS_FILE, `${JSON.stringify(state, null, 2)}\n`);
+  writeJsonAtomic(SPAWNS_FILE, state);
 }
 
 export function saveSpawn(record: SpawnRecord) {

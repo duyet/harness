@@ -38,6 +38,8 @@ import {
   saveSpawn,
   deleteSpawn,
   lastDelivery,
+  writeFileAtomic,
+  writeJsonAtomic,
   type State,
   type SpawnRecord,
   type LastDelivery,
@@ -1095,6 +1097,16 @@ function cmdGatewayStop() {
 
 async function readJsonPayload(from: number): Promise<Record<string, unknown>> {
   const file = optValue("--file", from);
+  // A terminal is never the source of a JSON payload. Reading one blocks
+  // forever — no EOF, no timeout, no hint — and it is the same `stdin.text()`
+  // hang class plan 009 closed one step downstream at `gh issue create`. The
+  // refusal lands before any useful work, so without it an operator finds out
+  // by sitting in a wedged terminal. Check before touching the stream.
+  if (!file && process.stdin.isTTY) {
+    throw new Error(
+      "refusing to read the payload from a terminal; pass --file PATH or pipe JSON on stdin (e.g. `cat event.json | harness issues ingest --source sentry`)",
+    );
+  }
   const text = file
     ? readFileSync(file, "utf8")
     : await Bun.stdin.text();
@@ -1327,9 +1339,14 @@ function writeSummaryDelivery(markdown: string, report: Record<string, unknown>)
     excerpt: markdown.slice(0, 600).trim(),
   };
   mkdirSync(STATE_DIR, { recursive: true });
-  writeFileSync(LAST_SUMMARY_FILE, markdown.endsWith("\n") ? markdown : `${markdown}\n`);
-  writeFileSync(LAST_SUMMARY_JSON_FILE, `${JSON.stringify(report, null, 2)}\n`);
-  writeFileSync(LAST_DELIVERY_FILE, `${JSON.stringify(record, null, 2)}\n`);
+  // The three files are the record `harness summary`, `gateway status` and
+  // /chat pickup all read back. A reader that catches a torn `last-delivery.json`
+  // reports no delivery at all, and one that catches a torn markdown body shows
+  // a summary that stops mid-sentence, so all three go through the atomic
+  // writer rather than only the JSON half.
+  writeFileAtomic(LAST_SUMMARY_FILE, markdown.endsWith("\n") ? markdown : `${markdown}\n`);
+  writeJsonAtomic(LAST_SUMMARY_JSON_FILE, report);
+  writeJsonAtomic(LAST_DELIVERY_FILE, record);
   return record;
 }
 

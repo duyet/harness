@@ -43,7 +43,7 @@ cat examples/herdr-config-ctrl-g.toml                       # the Ctrl+G snippet
 | `harness gateway start` | Background localhost HTTP + chat UI (`http://127.0.0.1:8787/`) |
 | `harness gateway status` | Listening?, pid, bind, lastEvent, lastDelivery |
 | `harness gateway stop` | Stop by pid file, after verifying that pid is still a harness gateway (`--force` overrides the refusal) |
-| `harness issues ingest --source sentry\|bugsink` | Mock GH issue draft from JSON stdin/`--file` (no GitHub API); `--execute` also runs a real `gh issue create`, bounded by a timeout (default 60s, `HARNESS_GH_TIMEOUT_MS`) |
+| `harness issues ingest --source sentry\|bugsink` | Mock GH issue draft from piped JSON stdin/`--file` (no GitHub API); a terminal is refused rather than read, so the payload must be piped or a file passed. `--execute` also runs a real `gh issue create`, bounded by a timeout (default 60s, `HARNESS_GH_TIMEOUT_MS`) |
 | `harness issues list` | Drafts under `~/.local/state/herdr-harness/issues/` |
 | `harness pick` | Next work: mock issue drafts (severity-ordered) → named tasks → freeform queue |
 | `harness summary` | On-demand markdown report (`--json` ok). **No cron.** `--deliver`/`--write` also writes `last-summary.md`/`.json` + `last-delivery.json` under the state dir |
@@ -98,6 +98,10 @@ Playbook **`desk:sentry-issues`**. Ingest writes a local mock draft and never ca
 The `gh` call is bounded: it gets at most `HARNESS_GH_TIMEOUT_MS` (default 60000, clamped 1000–300000) with stdin closed off, so a stalled network or a wedged `gh` can never hang the CLI. On timeout it is SIGKILLed and the envelope reports `timed out after Nms` — the draft stays `mock-draft`, because a timeout cannot tell you whether GitHub filed it, and re-running is safe.
 
 Drafts and the directory that holds them are both bounded. A payload over **96 KB** is stored as a UTF-8-safe prefix with `bodyTruncated: true` and the original `bodyBytes`, so a shortened draft is always visibly shortened — the fingerprint is still computed from the full event, so truncation never merges two distinct errors into one. Caller-supplied header values (`project`, `culprit`, `level`) are capped at 500 chars each and the title at 120. The directory holds at most **200 drafts** and **16 MB**, enforced after each write by evicting oldest `mock-draft` drafts; `github-created` drafts are never evicted, and the ingest envelope lists what the sweep removed under `draft.evicted` (returned only, never stored). Ordering is by file mtime, with drafts the filesystem timestamps alike broken by name — timestamp granularity is too coarse to separate a burst of writes. The 96 KB cap is what keeps the `--body` argument inside the 128 KB single-argv limit Linux enforces, which is also why it sits below the gateway's 256 KB request ceiling rather than at it.
+
+The payload is read from a pipe or a file, never from a terminal. Run without
+either and the subcommand refuses immediately with usage instead of waiting on
+input that will never arrive:
 
 ```bash
 echo '{"event_id":"abc","project":"harness","message":"TypeError: boom","culprit":"src/cli.ts","level":"error"}' \
