@@ -92,10 +92,15 @@ async function waitDead(pid: number, timeoutMs = 5000) {
   return !alive(pid);
 }
 
-/** A long-lived unrelated process, so its pid can stand in for a recycled one. */
-function startChild(label: string) {
+/**
+ * A long-lived process whose command line is the runner plus whatever argv we append, so a test
+ * can pose any shape it wants `looksLikeGateway` to judge — and then hand its pid to the CLI as
+ * a recycled one.
+ */
+function startChild(...argv: string[]) {
+  const label = argv.join(" ") || "(bare)";
   return new Promise<{ pid: number; child: ChildProcess }>((resolve, reject) => {
-    const child = spawn(process.execPath, [RUNNER, label, fixture.home, fixture.cwd], {
+    const child = spawn(process.execPath, [RUNNER, "idle", fixture.home, fixture.cwd, ...argv], {
       cwd: fixture.cwd,
       env: cliEnv(),
       stdio: ["ignore", "pipe", "pipe"],
@@ -112,6 +117,14 @@ function startChild(label: string) {
     });
     child.on("error", reject);
   });
+}
+
+/** Identity the CLI reports for `pid`, read through a real `gateway status`. */
+function identityOf(pid: number): { kind: string; command?: string } {
+  writePid(`${pid}\n`);
+  const status = JSON.parse(runCli(["gateway", "status"]).stdout);
+  expect(status.pid).toBe(pid);
+  return status.identity;
 }
 
 function startSleep() {
@@ -156,8 +169,12 @@ describe("gateway pid identity", () => {
     expect(gatewayPid).toBeGreaterThan(0);
 
     const status = JSON.parse(runCli(["gateway", "status"]).stdout);
-    expect(status).toMatchObject({ ok: true, listening: true, pid: gatewayPid });
+    expect(status).toMatchObject({ ok: true, listening: true, pid: gatewayPid, identity: { kind: "gateway" } });
     expect(status.reason).toBeUndefined();
+    // The real detached argv this fix has to keep recognising: the entrypoint as an absolute
+    // path, not the token-mentioning shapes the near-miss table below refuses.
+    const realCmdline = readFileSync(`/proc/${gatewayPid}/cmdline`, "utf8").replace(/\0/g, " ").trim();
+    expect(realCmdline).toContain(`${join(ROOT, "src", "gateway.ts")}`);
 
     const stopped = runCli(["gateway", "stop"]);
     expect(stopped.exit).toBe(0);
@@ -210,9 +227,9 @@ describe("gateway pid identity", () => {
   });
 
   test("gateway.json holding a different pid refuses even a gateway-shaped command line", async () => {
-    // This process's cmdline contains `gateway.ts`, so only the pid/meta agreement layer
+    // This process's cmdline names the gateway entrypoint, so only the pid/meta agreement layer
     // can refuse it — the command-line layer would wave it through.
-    const lookalike = await startChild("gateway.ts");
+    const lookalike = await startChild(join(ROOT, "src", "gateway.ts"));
     writePid(`${lookalike.pid}\n`);
     writeMeta({ pid: lookalike.pid + 1, bind: { hostname: "127.0.0.1", port: Number(PORT) } });
 
@@ -225,7 +242,7 @@ describe("gateway pid identity", () => {
   });
 
   test("a missing or corrupt gateway.json is never a match; the command line decides", async () => {
-    const absent = await startChild("gateway.ts");
+    const absent = await startChild(join(ROOT, "src", "gateway.ts"));
     writePid(`${absent.pid}\n`);
     expect(existsSync(metaPath())).toBe(false);
     // No meta to agree with, so the command line carries it: this one really is a gateway.
@@ -270,5 +287,128 @@ describe("gateway pid identity", () => {
 
       expect(stopSignals()).toMatchObject({ exit: 0, signals: [] });
     }
+  });
+});
+
+/**
+ * Plan 034. `looksLikeGateway` used to answer `command.includes("gateway.ts")` in its first
+ * branch, so any process whose command line merely *mentioned* the entrypoint was `{kind:
+ * "gateway"}` and `gateway stop` destroyed it with no `--force` and no refusal. The first
+ * branch now asks for the token — and the absolute-path requirement is forced by the table
+ * below: `bun src/gateway.ts` and `vim src/gateway.ts` are the same string.
+ */
+describe("looksLikeGateway tokenization (plan 034)", () => {
+  const GATEWAY_ENTRYPOINT = join(ROOT, "src", "gateway.ts");
+  const CLI_ENTRYPOINT = join(ROOT, "src", "cli.ts");
+
+  test("both legitimate gateway shapes are still gateway — a rejections-only fix would fail here", async () => {
+    // The detached spawn `gateway start` really performs.
+    const detached = await startChild(GATEWAY_ENTRYPOINT);
+    expect(identityOf(detached.pid).kind).toBe("gateway");
+
+    // The `--foreground` shape: the CLI serving in-process as `… cli.ts gateway start`.
+    const foreground = await startChild(CLI_ENTRYPOINT, "gateway", "start");
+    expect(identityOf(foreground.pid).kind).toBe("gateway");
+
+    // …and both are still *stoppable*, which is the half a rejections-only fix breaks. The
+    // runner mocks process.kill, so this observes the signal rather than delivering it.
+    for (const { pid } of [detached, foreground]) {
+      expect(alive(pid)).toBe(true);
+      writePid(`${pid}\n`);
+      expect(stopSignals()).toMatchObject({ exit: 0, signals: [{ pid, signal: "SIGTERM" }] });
+      expect(alive(pid)).toBe(true);
+    }
+  });
+
+  test("a command line that merely mentions gateway.ts is recycled, not a match", async () => {
+    // Each of these is accepted by `command.includes("gateway.ts")`. Every one is somebody
+    // citing the entrypoint — an editor, a search, a log tail, a neighbouring file — and the
+    // substring branch used to wave all of them through as the gateway itself.
+    const table: [string, string[]][] = [
+      ["editor, cwd-relative", ["vim", "src/gateway.ts"]],
+      ["search, bare filename", ["grep", "-rn", "gateway.ts", "src/"]],
+      ["pager, bare filename", ["less", "README.md", "gateway.ts"]],
+      // /proc/<pid>/cmdline has no quotes, so this arrives as `… -p fix gateway.ts`.
+      ["agent prompt, quoted", ["claude", "-p", "fix gateway.ts"]],
+      ["log tail, token is a prefix", ["tail", "-f", "/var/log/gateway.ts.log"]],
+      ["neighbouring file, longer extension", ["node", "gateway.tsx"]],
+      ["backup, token is a prefix", ["gateway.ts.bak"]],
+      ["token buried mid-element", ["/opt/gateway.ts.backup/run"]],
+    ];
+
+    const spawned: { pid: number }[] = [];
+    for (const [_name, argv] of table) {
+      // Precondition on the fixture itself: every row really does contain the substring, so
+      // the table cannot pass vacuously against a matcher that never had to reject it.
+      expect(argv.join(" ")).toContain("gateway.ts");
+      spawned.push(await startChild(...argv));
+    }
+
+    for (const { pid } of spawned) {
+      expect(identityOf(pid).kind).toBe("recycled");
+      expect(alive(pid)).toBe(true);
+    }
+  }, 60000);
+
+  test("gateway stop refuses a live process holding the token, and the process survives", async () => {
+    // End to end through the real cmdGatewayStop: a pid file naming an unrelated process whose
+    // command line carries the token, with no gateway.json to contradict it. Pre-034 this was
+    // a `{kind:"gateway"}` match and the SIGKILL below landed.
+    const victim = await startChild("vim", "src/gateway.ts");
+    writePid(`${victim.pid}\n`);
+    expect(existsSync(metaPath())).toBe(false);
+
+    const status = JSON.parse(runCli(["gateway", "status"]).stdout);
+    expect(status).toMatchObject({ ok: true, listening: false, pid: victim.pid, identity: { kind: "recycled" } });
+    expect(status.reason).toContain(`pid ${victim.pid} is not a harness gateway`);
+
+    const stopped = runCli(["gateway", "stop"]);
+    expect(stopped.exit).toBe(1);
+    // The same refusal shape the recycled-pid path already produced.
+    expect(JSON.parse(stopped.stdout)).toMatchObject({
+      ok: false,
+      stopped: false,
+      refused: true,
+      pid: victim.pid,
+      removedPidFile: true,
+    });
+    expect(alive(victim.pid)).toBe(true);
+    expect(existsSync(pidPath())).toBe(false);
+
+    // Nothing was even attempted, seen from inside the CLI.
+    writePid(`${victim.pid}\n`);
+    expect(stopSignals()).toMatchObject({ exit: 1, signals: [] });
+    expect(alive(victim.pid)).toBe(true);
+  });
+
+  test("an absent or a corrupt gateway.json still refuses — the command line is the only guard", async () => {
+    // This is 034's precondition, and it is the *ordinary* case: gateway.json is written only
+    // after Bun.serve succeeds, so a crashed or never-bound gateway leaves a bare pid file and
+    // the command-line layer standing alone between a recycled pid and a SIGKILL.
+    const absent = await startChild("grep", "-rn", "gateway.ts", "src/");
+    writePid(`${absent.pid}\n`);
+    expect(existsSync(metaPath())).toBe(false);
+    expect(identityOf(absent.pid).kind).toBe("recycled");
+    expect(runCli(["gateway", "stop"]).exit).toBe(1);
+    expect(alive(absent.pid)).toBe(true);
+
+    const corrupt = await startChild("claude", "-p", "fix gateway.ts");
+    writePid(`${corrupt.pid}\n`);
+    writeMeta("{ not json");
+    const status = JSON.parse(runCli(["gateway", "status"]).stdout);
+    expect(status).toMatchObject({ listening: false, identity: { kind: "recycled" } });
+    expect(status.reason).toContain("gateway.json pid: none");
+    expect(runCli(["gateway", "stop"]).exit).toBe(1);
+    expect(alive(corrupt.pid)).toBe(true);
+  });
+
+  test("--force is still available for a token-holding process, and still signals it", async () => {
+    const victim = await startChild("vim", "src/gateway.ts");
+    writePid(`${victim.pid}\n`);
+
+    const stopped = runCli(["gateway", "stop", "--force"]);
+    expect(stopped.exit).toBe(0);
+    expect(JSON.parse(stopped.stdout)).toMatchObject({ ok: true, stopped: true, pid: victim.pid });
+    expect(await waitDead(victim.pid)).toBe(true);
   });
 });

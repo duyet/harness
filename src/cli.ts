@@ -1007,13 +1007,37 @@ function processCommand(pid: number): string | null {
 }
 
 /**
+ * "This command line mentions `name` as a token" — one predicate for both shapes below.
+ *
+ * `file` names an entrypoint, so it counts only when some argument is an **absolute** path whose
+ * final element is exactly that file: `gateway start` spawns `bun <ROOT>/src/gateway.ts`, and
+ * ROOT is absolute. Bare and relative mentions (`grep -rn gateway.ts src/`, `vim src/gateway.ts`,
+ * a `claude -p "fix gateway.ts"` whose quotes /proc drops) are somebody *citing* the entrypoint,
+ * not running it, and a longer element around it (`gateway.ts.log`, `node gateway.tsx`,
+ * `/opt/gateway.ts.backup/run`) names a different file. The absolute-path requirement is forced
+ * rather than stylistic: `bun src/gateway.ts` and `vim src/gateway.ts` are the same string, so no
+ * relative rule can tell the gateway from an editor holding it open.
+ *
+ * `word` is the `--foreground` shape (`bun <ROOT>/src/cli.ts gateway start`), where the subcommand
+ * is a bare word by construction.
+ */
+function mentionsToken(command: string, name: string, shape: "file" | "word"): boolean {
+  const w = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = shape === "file" ? `(^|\\s)/\\S*/${w}(\\s|$)` : `(^|\\s)${w}(\\s|$)`;
+  return new RegExp(pattern).test(command);
+}
+
+/**
  * A harness gateway is one of two processes: the detached `src/gateway.ts` that
  * `gateway start` spawns, or the CLI itself when `--foreground` serves in-process.
  */
 function looksLikeGateway(command: string): boolean {
-  if (command.includes("gateway.ts")) return true;
-  const word = (w: string) => new RegExp(`(^|\\s)${w}(\\s|$)`).test(command);
-  return command.includes("cli.ts") && word("gateway") && word("start");
+  if (mentionsToken(command, "gateway.ts", "file")) return true;
+  return (
+    command.includes("cli.ts") &&
+    mentionsToken(command, "gateway", "word") &&
+    mentionsToken(command, "start", "word")
+  );
 }
 
 /**

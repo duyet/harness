@@ -3,16 +3,17 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spyOn } from "bun:test";
 
-// argv: <label> <home> <cwd> [extra `gateway stop` flags...]
+// argv: <role> <home> <cwd> [...extra]
 //
-// decoy      — a long-lived process that is NOT a gateway. Its command line fails the
-//              gateway marker check, so the command-line layer alone must refuse it.
-// gateway.ts  — identical behaviour, but the label makes the process command line contain
-//              the gateway entrypoint. Only the gateway.json/pid agreement check can
-//              refuse it, which is what isolates that layer.
-// signals     — runs the real `harness gateway stop` in-process with process.kill recorded
-//              and process.exit trapped, and reports every signal it attempted.
-const label = process.argv[2];
+// idle      — a long-lived process whose command line is `bun <this file> idle <home> <cwd>`
+//              plus whatever argv the caller appended. That tail is what /proc/<pid>/cmdline
+//              hands `looksLikeGateway`, so a caller can pose any argv shape it wants to be
+//              judged on — an editor, a grep, a `tail -f`, or the real entrypoint path —
+//              without this file ever matching it itself.
+// signals   — runs the real `harness gateway stop` in-process with process.kill recorded
+//              and process.exit trapped, and reports every signal it attempted. Its extra
+//              argv is the `gateway stop` flags.
+const role = process.argv[2];
 const home = process.argv[3];
 const cwd = process.argv[4];
 
@@ -25,11 +26,11 @@ assert.equal(process.cwd(), cwd);
 const { STATE_DIR } = await import("../../src/shared.ts");
 assert.equal(STATE_DIR, join(home, ".local", "state", "herdr-harness"));
 
-if (label === "decoy" || label === "gateway.ts") {
+if (role === "idle") {
   // Stay alive as the plausible unrelated process a stale pid file could name.
-  console.log(JSON.stringify({ pid: process.pid, label }));
+  console.log(JSON.stringify({ pid: process.pid }));
   await new Promise(() => {});
-} else if (label === "signals") {
+} else if (role === "signals") {
   const signals: { pid: number; signal: string }[] = [];
   let delivered = false;
   spyOn(process, "kill").mockImplementation(((target: number | string, sig: number | string) => {
@@ -66,5 +67,5 @@ if (label === "decoy" || label === "gateway.ts") {
   console.log = realLog;
   realLog(JSON.stringify({ signals, exit: exit ?? 0, printed }));
 } else {
-  unexpected(`unknown runner label: ${label}`);
+  unexpected(`unknown runner role: ${role}`);
 }
