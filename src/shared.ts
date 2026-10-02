@@ -39,7 +39,14 @@ export type State = {
   installedVersion?: string;
   installedRoot?: string;
   gitDescribe?: string;
-  lastPicked?: { id: string; kind: string; adapter?: string; at: string };
+  // `eventAt` is the freeform tier's rotation cursor only: `id` there is
+  // `event.taskId || "freeform"`, which for any untagged event records the
+  // literal string "freeform" and so identifies nothing, while the queue is a
+  // bounded ring whose positions renumber as old events are trimmed. The
+  // event's own `at` is the only handle already on the entry that stays
+  // meaningful. Optional, so a state.json written before rotation loads; absent
+  // means "no cursor" and the tier falls back to the newest event.
+  lastPicked?: { id: string; kind: string; adapter?: string; at: string; eventAt?: string };
 };
 
 export type AdapterRoute = {

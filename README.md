@@ -116,8 +116,9 @@ Gateway (restart after upgrade so new routes load): `POST /ingress/sentry` and `
 2. Within issues: only `status: "mock-draft"` is pickable work — `github-created` drafts are never re-picked (if only created drafts remain, the issue tier is skipped entirely).
 3. Higher severity `level` (from labels or `raw.level`) wins: `fatal > error > warning > info > other`.
 4. Newer `createdAt` breaks severity ties.
-5. Within tasks: rotate by list order after `lastPicked`; on a cold start (no prior task pick), tasks with a `worktree` stub are preferred before tasks without.
-6. Freeform: the most recent freeform ingress event wins.
+5. Within issues: rotate down that ranking after `lastPicked`, so consecutive picks walk the drafts instead of returning the same one forever. Rotation moves only the starting point — severity still dominates at every position. A cold start (no prior issue pick), or a cursor whose draft has since been published, evicted or deleted, takes the highest-severity, newest draft again rather than skipping an entry.
+6. Within tasks: rotate by list order after `lastPicked`; on a cold start (no prior task pick), tasks with a `worktree` stub are preferred before tasks without.
+7. Within freeform: rotate through the queue after `lastPicked`. The cursor is the picked event's `at` timestamp, not its position, because the queue is a bounded ring that renumbers as it trims; `id` cannot serve as one — an untagged event records the literal `"freeform"`. A cold start, or a cursor whose event has aged out of the ring, takes the most recent freeform event.
 
 **Summary is CLI-only — no scheduler.** `harness summary --deliver` (alias `--write`) is the human-delivery stub: it writes the report to `~/.local/state/herdr-harness/last-summary.md` plus a `last-summary.json` sidecar, and records a `lastDelivery` blob in `last-delivery.json` that `harness gateway status --json`, `GET /status` and `harness summary` surface. Stub-mode `POST /chat` replies pick the last summary up when asked — body `"pickup": true`, a `?pickup=true` query flag, or the literal text `/summary` — by appending its excerpt and returning it as `lastSummary` (`null` when nothing was delivered). Executed `/chat` replies are never amended.
 

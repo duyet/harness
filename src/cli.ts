@@ -1122,8 +1122,10 @@ const PICK_RULES = [
   "issues: only mock-draft is pickable work; github-created is never re-picked",
   "issues: higher severity level first (fatal > error > warning > info > other)",
   "issues: newer createdAt breaks severity ties",
+  "issues: rotate down the ranked drafts after lastPicked; a cold start, or a draft that has since been published or evicted, takes the highest severity again",
   "tasks: rotate by list order after lastPicked; a cold start prefers tasks with a worktree stub",
-  "freeform: most recent freeform ingress event wins",
+  "freeform: rotate through freeform ingress events after lastPicked, keyed on the event's at timestamp rather than its position in the trimmed queue",
+  "freeform: a cold start, or a cursor whose event has aged out of the queue, takes the most recent freeform event",
 ];
 
 function cmdPick() {
@@ -1144,9 +1146,23 @@ function cmdPick() {
     title?: string;
     severity?: string;
   } | null = null;
+  // The freeform event's own `at`, recorded so the next pick can find that
+  // event again. Undefined for every other kind, and for a timestamp-less
+  // freeform event; the save below omits the field entirely in that case.
+  let cursor: string | undefined;
 
   if (drafts.length) {
-    const d = drafts[0];
+    // Rotation mirrors the task tier: `lastPicked` names the draft taken last,
+    // and this pick starts one entry further down the *already ranked* list.
+    // That moves the starting point only — `rankIssueDrafts` still owns the
+    // order, so severity still dominates at every position.
+    const lastId = prev.lastPicked?.kind === "issue" ? prev.lastPicked.id : null;
+    const idx = lastId ? drafts.findIndex((d) => `issue:${d.fingerprint}` === lastId) : -1;
+    // Cold start, or a cursor whose draft has since been published, evicted by
+    // the bounded draft directory, or hand-deleted: fall back to the head of
+    // the ranking. Computing `(idx + 1) % length` off a -1 would skip an entry
+    // permanently, which is the bug this rotation exists to fix.
+    const d = idx >= 0 ? drafts[(idx + 1) % drafts.length] : drafts[0];
     chosen = {
       id: `issue:${d.fingerprint}`,
       kind: "issue",
@@ -1176,7 +1192,20 @@ function cmdPick() {
             : "priority: named tasks by list order (rotate after lastPicked)",
     };
   } else {
-    const free = [...queue].reverse().find((e) => e.freeform);
+    // Oldest to newest: the queue is append-only and `trimQueue` drops from the
+    // front, so an index into it is not a stable handle — one new arrival
+    // renumbers every position. The cursor is therefore the taken event's own
+    // `at`, not its id: `free.taskId || "freeform"` records the literal string
+    // "freeform" for any untagged event and identifies nothing at all.
+    const freeform = queue.filter((e) => e.freeform);
+    const lastAt = prev.lastPicked?.kind === "freeform" ? prev.lastPicked.eventAt : undefined;
+    const idx = lastAt ? freeform.findIndex((e) => e.at === lastAt) : -1;
+    // No cursor, or one whose event has aged out of the ring: take the newest,
+    // which is what this tier has always done. `freeform[-1]` is undefined when
+    // the queue holds no freeform event, so the "nothing to pick" path is intact.
+    // Two events sharing one `at` are indistinguishable by construction; the
+    // first match wins, so such a pair repeats rather than skipping either.
+    const free = idx >= 0 ? freeform[(idx + 1) % freeform.length] : freeform[freeform.length - 1];
     if (free) {
       chosen = {
         id: free.taskId || "freeform",
@@ -1185,6 +1214,9 @@ function cmdPick() {
         reason: "priority: freeform ingress queue",
         title: free.text ?? undefined,
       };
+      // Only a timestamped event can be found again on the next pick; an `at`-
+      // less entry records no cursor, so that pick falls back to the newest.
+      if (free.at) cursor = free.at;
     }
   }
 
@@ -1200,7 +1232,13 @@ function cmdPick() {
   const state = loadState();
   saveState({
     ...state,
-    lastPicked: { id: chosen.id, kind: chosen.kind, adapter: chosen.adapter, at: new Date().toISOString() },
+    lastPicked: {
+      id: chosen.id,
+      kind: chosen.kind,
+      adapter: chosen.adapter,
+      at: new Date().toISOString(),
+      ...(cursor ? { eventAt: cursor } : {}),
+    },
   });
 
   const json = { ok: true, ...chosen, rules: PICK_RULES };
