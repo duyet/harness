@@ -787,7 +787,18 @@ export async function handleGatewayRequest(req: Request, bind: ReturnType<typeof
       lastEvent: result.lastEvent,
       queued: result.queued,
     };
-    if (reply.mode === "stub" && chatPickupRequested(parsed.body, url, result.task.text)) {
+    // Pickup returns stored operator state the caller did not send — unlike a stub
+    // reply, which echoes the caller's own text back. Hold it to the same bind
+    // condition as execute, so a request the gate refuses is not also handed the
+    // report on the same bind. Deliberately not an Origin check: absent Origin has
+    // to keep working for curl and for the chat page.
+    const pickupAllowed =
+      isLoopbackHostname(bind.hostname) || chatEnvEnabled(CHAT_ALLOW_REMOTE_ENV);
+    if (
+      reply.mode === "stub" &&
+      pickupAllowed &&
+      chatPickupRequested(parsed.body, url, result.task.text)
+    ) {
       const delivery = lastDelivery();
       body.lastSummary = delivery
         ? { at: delivery.at, excerpt: delivery.excerpt }

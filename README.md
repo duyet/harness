@@ -160,7 +160,7 @@ All five POST routes (`/chat` and `/ingress/matrix`, `/ingress/telegram`, `/ingr
 
 ### `/chat execute` gate
 
-**`POST /chat` is unauthenticated by design. Anyone who can reach the port can POST, and with execute they can spawn processes. Never expose the gateway to an untrusted network.** Stub mode (no `execute`) still works on any bind — the gate only applies to execution, and it refuses by returning the normal **200** stub reply with an `executeError` instead of running anything.
+**`POST /chat` is unauthenticated by design. Anyone who can reach the port can POST, and with execute they can spawn processes. Never expose the gateway to an untrusted network.** Stub mode (no `execute`) still works on any bind — the gate only applies to execution, and it refuses by returning the normal **200** stub reply with an `executeError` instead of running anything. The one exception is summary pickup (`"pickup": true`, `?pickup=true`, or the text `/summary`): a stub reply only echoes the caller's own message back, but pickup returns stored operator state the caller never sent, so it is covered by the same loopback bind check (check 2 below) and the same `HARNESS_CHAT_ALLOW_REMOTE=1` opt-in. On a non-loopback bind without that opt-in a pickup request is answered with the ordinary stub reply and no `lastSummary` field.
 
 Three checks must all pass before a subprocess is spawned:
 

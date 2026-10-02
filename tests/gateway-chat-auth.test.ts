@@ -94,4 +94,8 @@ describe("gateway /chat execute gate (isolated, no sockets)", () => {
   test("plain stub mode is unaffected by every bind and Origin combination", () => {
     run("stub-modes");
   });
+
+  test("summary pickup is held to the same bind check as execute", () => {
+    run("pickup");
+  });
 });
