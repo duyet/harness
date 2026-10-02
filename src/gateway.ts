@@ -98,11 +98,25 @@ const INGRESS_TASK_ID_MAX_CHARS = 512;
 // hard stop.
 const INGRESS_REQUEST_MAX_BYTES = 256 * 1024;
 
-// The event/response key names a capped field writes. One list, so the shared
-// cap helper stays generic and the projection cannot drift from the type.
-type CapField = "text" | "sender" | "channel" | "taskId";
+// The caller-controlled fields `handleIngress` caps, in one list. Every
+// truncation flag on the stored event, on `/status` and on the POST responses is
+// produced by walking this list (`capFieldFlags`), so a field added to it is
+// flagged on every surface at once. That is the shape plan 030 found missing:
+// the flags existed for `text` alone, on a response that silently shortened
+// `taskId`, `sender` and `channel` in the same object.
+const CAPPED_FIELDS = ["text", "sender", "channel", "taskId"] as const;
 
-type Capped = { value: string | null; truncated?: boolean; bytes?: number };
+// The event/response key names a capped field writes. Derived from the list
+// above, so the two cannot drift apart.
+type CapField = (typeof CAPPED_FIELDS)[number];
+
+// A discriminated pair rather than three independently-optional fields, so a
+// `truncated: true` value is statically known to carry its byte count: the flag
+// and the number it describes cannot drift apart at any call site.
+type Capped =
+  | { value: string | null; truncated?: false; bytes?: undefined }
+  | { value: string; truncated: true; bytes: number };
+type CappedFields = Record<CapField, Capped>;
 
 function byteLength(value: string): number {
   return Buffer.byteLength(value, "utf8");
@@ -164,38 +178,42 @@ function capString(value: string | null, maxChars: number): Capped {
 
 // A capped field that is not visibly capped reads as data loss with no
 // explanation, so the `<field>Truncated` / `<field>Bytes` pair travels with it
-// onto the stored event and into the unauthenticated `/status` projection.
+// onto the stored event, into the unauthenticated `/status` projection, and onto
+// the POST response.
 // The two key families are kept apart on purpose: the flag is always `true` and
-// the count always lands beside it under `<field>Bytes`, so their types are
-// picked from `IngressEvent` separately. Typing both as one `boolean | number`
-// union is what let a byte count pass as a truncation flag at the event site.
-type CapFlagFields<F extends CapField> = {
-  [K in `${F}Truncated`]?: IngressEvent[K];
-} & {
-  [K in `${F}Bytes`]?: IngressEvent[K];
+// the count always lands beside it under `<field>Bytes`, so the key remapping
+// names one `boolean` and one `number` and a byte count cannot pass as a
+// truncation flag at the event site. Typing both as one `boolean | number`
+// union is what let that happen before.
+type CapFlags = { [K in CapField as `${K}Truncated`]?: boolean } & {
+  [K in CapField as `${K}Bytes`]?: number;
 };
 
-function capFlags<F extends CapField>(capped: Capped, field: F): CapFlagFields<F> {
-  if (!capped.truncated) return {};
-  return {
-    [`${field}Truncated`]: true,
-    [`${field}Bytes`]: capped.bytes,
-    // The one assertion left in this helper, and it was here before this plan:
-    // a key computed from a generic `F` is a pattern template literal that the
-    // checker will not match against the mapped type. It states the shape the
-    // two lines above plainly have, which the previous `boolean | number` union
-    // did not.
-  } as CapFlagFields<F>;
+// The one place a capped field becomes a visible flag, for every surface. It
+// walks `CAPPED_FIELDS` rather than taking a field name, so there is no second
+// list for the next capped field to be added to and forgotten in — which is
+// exactly how three of the four ended up unflagged on the response alone.
+// A field below its cap contributes nothing, so an ordinary event serializes
+// exactly as it did before any of this existed.
+function capFieldFlags(capped: CappedFields): CapFlags {
+  const flags: Record<string, boolean | number> = {};
+  for (const field of CAPPED_FIELDS) {
+    const value = capped[field];
+    if (!value.truncated) continue;
+    flags[`${field}Truncated`] = true;
+    flags[`${field}Bytes`] = value.bytes;
+  }
+  return flags as CapFlags;
 }
 
 // `text` is what the chat page header and `harness summary` display, so it is
 // capped on its own: letting the body budget cut it would truncate it at an
-// arbitrary offset chosen by key order. Kept as a named wrapper because the
-// event construction site and the projection both refer to it by name.
-function capText(text: string | null): Pick<IngressEvent, "text" | "textTruncated" | "textBytes"> {
-  const capped = capString(text, INGRESS_TEXT_MAX_CHARS);
-  if (!capped.truncated) return { text: capped.value };
-  return { text: capped.value, textTruncated: true, textBytes: capped.bytes };
+// arbitrary offset chosen by key order. This is the *value* half only — the
+// task deliberately still carries the whole text, because the adapter prompt and
+// the `/summary` pickup key need it — so the response projection re-derives the
+// capped value here and takes the flag from `capFieldFlags` beside it.
+function capTextValue(text: string | null): Pick<IngressEvent, "text"> {
+  return { text: capString(text, INGRESS_TEXT_MAX_CHARS).value };
 }
 
 // The bounds above apply to what is *persisted*; nothing bounded what was
@@ -204,16 +222,25 @@ function capText(text: string | null): Pick<IngressEvent, "text" | "textTruncate
 // response is the caller's own bytes, so this is not a disclosure; it is that an
 // endpoint documented as bounding ingress must not hand back more than it
 // stores. The fields a caller correlates an ingest with (id, adapter, route
-// decision, sender, channel) all survive, and the cap is `capText` rather than a
-// new one so a shortened response says so with `textTruncated` / `textBytes`
-// instead of reading as a short message.
-function projectTask(task: ReturnType<typeof handleIngress>["task"]) {
+// decision, sender, channel) all survive, and the cap is the one the event was
+// stored under rather than a new one.
+function projectTask(result: ReturnType<typeof handleIngress>) {
   // The cap is spread *over* the task rather than beside it, so `text` keeps the
   // position it already held: an ordinary answer then serializes to exactly the
-  // bytes it did before this projection existed, and the truncation flags —
-  // which `capText` omits entirely when nothing was cut — are the only keys a
-  // capped answer adds.
-  return { ...task, ...capText(task.text) };
+  // bytes it did before this projection existed. The flags are the second
+  // spread, and they arrive already named — `capFieldFlags` built them from the
+  // one list, so every capped field on this response is flagged, not just the
+  // one this function remembers to check.
+  return { ...result.task, ...capTextValue(result.task.text), ...result.taskFlags };
+}
+
+// `handleIngress` hands the flags back so `projectTask` has the one list to
+// apply; the 202 envelope is that same result with the task projected, so the
+// flags are consumed here rather than echoed as a second top-level key beside
+// the ones they describe.
+function ingressResponse(result: ReturnType<typeof handleIngress>): Response {
+  const { taskFlags, ...envelope } = result;
+  return Response.json({ ...envelope, task: projectTask(result) }, { status: 202 });
 }
 
 // Count window first, then the byte budget, so a burst of large events cannot
@@ -355,21 +382,32 @@ export function handleIngress(source: "matrix" | "telegram" | "chat", raw: Recor
     route = { error: "freeform intent", defaultAdapter, freeform: true };
   }
 
+  // The four caller-controlled values, capped once and in one place, so the
+  // event, `/status` and the response all read the same numbers. The three id /
+  // sender / channel values arrived already capped from their normalizers;
+  // `text` is capped here because it is left uncapped in the task below.
+  const capped: CappedFields = {
+    text: capString(norm.text, INGRESS_TEXT_MAX_CHARS),
+    sender: norm.sender,
+    channel: norm.channel,
+    taskId: norm.taskId,
+  };
+  // One flag set, walked from the one list, reused by the response projection.
+  const flags = capFieldFlags(capped);
+
   const event: IngressEvent = {
     at: new Date().toISOString(),
     source,
-    taskId: norm.taskId.value,
-    ...capText(norm.text),
-    sender: norm.sender.value,
-    channel: norm.channel.value,
+    taskId: capped.taskId.value,
+    text: capped.text.value,
+    sender: capped.sender.value,
+    channel: capped.channel.value,
     freeform,
     route,
     ...capBody(raw),
-    // The values above were already capped by their normalizer; these carry the
-    // flags that make a capped field visibly capped rather than quietly short.
-    ...capFlags(norm.taskId, "taskId"),
-    ...capFlags(norm.sender, "sender"),
-    ...capFlags(norm.channel, "channel"),
+    // The values above were already capped; these make a capped field visibly
+    // capped rather than quietly short, here and on the way back out.
+    ...flags,
   };
   const saved = persistIngress(event);
 
@@ -378,13 +416,17 @@ export function handleIngress(source: "matrix" | "telegram" | "chat", raw: Recor
     source,
     queued: saved.queued,
     task: {
-      id: norm.taskId.value,
+      id: capped.taskId.value,
+      // The whole text, deliberately: the adapter prompt and the `/summary`
+      // pickup key both read it, and neither is a reflection. The response
+      // projection caps its copy.
       text: norm.text,
-      sender: norm.sender.value,
-      channel: norm.channel.value,
+      sender: capped.sender.value,
+      channel: capped.channel.value,
       adapterId,
       freeform,
     },
+    taskFlags: flags,
     route: routeObj,
     lastEvent: event.at,
   };
@@ -394,7 +436,7 @@ function stubReply(result: ReturnType<typeof handleIngress>): string {
   // Through the projection, because the freeform branch below interpolates the
   // caller's own text: capping the task alone would still leave the payload a
   // second time in the same response.
-  const t = projectTask(result.task);
+  const t = projectTask(result);
   if (t.freeform) {
     return `stub: freeform via ${t.adapterId} — ${t.text ?? "(empty)"}`;
   }
@@ -739,23 +781,54 @@ function projectDelivery(delivery: LastDelivery | null): Record<string, unknown>
   };
 }
 
+// The draft's `id` and `fingerprint` are the caller's own `event_id` verbatim
+// (`fingerprintFor` returns one uncapped, deliberately — it is the draft's
+// identity), so projecting them unclipped made a 200 KB POST answer with 400 KB.
+// Same bound plan 023 applies to the fingerprint where it enters the issue body:
+// 500 characters, two orders of magnitude above a real Sentry or Bugsink id.
+// Applied here, on the *reflection* only — the value on disk is untouched, so the
+// draft keeps its identity and two long ids sharing a 500-char prefix still
+// cannot collapse onto one draft.
+const ISSUE_DRAFT_ID_MAX_CHARS = 500;
+
+// A shortened value must never read as a real one, so the `<field>Truncated` /
+// `<field>Bytes` pair the stored event and `/status` already carry travels onto
+// this projection too. Absent below the cap, so an ordinary draft's answer is
+// byte-identical to what it was before.
+function flagCapped(projection: Record<string, unknown>, field: string, capped: Capped): void {
+  if (!capped.truncated) return;
+  projection[`${field}Truncated`] = true;
+  projection[`${field}Bytes`] = capped.bytes;
+}
+
 // `/ingress/sentry` and `/ingress/bugsink` are unauthenticated, so their 202
 // answers a projection the way `/status` does — never the draft. Returning the
 // whole draft re-served the entire stored payload, which for a large event is
 // megabytes echoed straight back to the POSTer. What survives is what a caller
 // needs to correlate the ingest and then go read the file.
+//
+// The rule `projectDelivery` states is applied here too: the projection keeps
+// what identifies a delivery and its size, and drops the filesystem layout. So
+// there is no `path` — an absolute path under `$HOME`, embedding the OS
+// username, on a route documented as unauthenticated. The draft's filename is
+// derived from its fingerprint, so every correlation value a caller had before
+// is still in the answer, and `harness issues list --json` still reports the
+// path to the local operator who can reach the disk anyway.
 function projectIssueDraft(draft: IssueDraft): Record<string, unknown> {
+  const id = capString(draft.id, ISSUE_DRAFT_ID_MAX_CHARS);
+  const fingerprint = capString(draft.fingerprint, ISSUE_DRAFT_ID_MAX_CHARS);
   const projection: Record<string, unknown> = {
-    id: draft.id,
-    fingerprint: draft.fingerprint,
+    id: id.value,
+    fingerprint: fingerprint.value,
     title: draft.title,
     source: draft.source,
     playbook: draft.playbook,
     labels: draft.labels,
     status: draft.status,
-    path: draft.path,
     createdAt: draft.createdAt,
   };
+  flagCapped(projection, "id", id);
+  flagCapped(projection, "fingerprint", fingerprint);
   if (draft.githubIssueUrl) projection.githubIssueUrl = draft.githubIssueUrl;
   if (draft.githubIssueNumber != null) projection.githubIssueNumber = draft.githubIssueNumber;
   if (draft.bodyTruncated) {
@@ -782,7 +855,7 @@ export async function handleGatewayRequest(req: Request, bind: ReturnType<typeof
     const body: Record<string, unknown> = {
       ok: true,
       ...reply,
-      task: projectTask(result.task),
+      task: projectTask(result),
       route: result.route,
       lastEvent: result.lastEvent,
       queued: result.queued,
@@ -824,14 +897,14 @@ export async function handleGatewayRequest(req: Request, bind: ReturnType<typeof
     if (!parsed.ok) return parsed.response;
     if (!matrixShape(parsed.body)) return badPayload();
     const result = handleIngress("matrix", parsed.body);
-    return Response.json({ ...result, task: projectTask(result.task) }, { status: 202 });
+    return ingressResponse(result);
   }
   if (req.method === "POST" && url.pathname === "/ingress/telegram") {
     const parsed = await parseJsonObject(req);
     if (!parsed.ok) return parsed.response;
     if (!telegramShape(parsed.body)) return badPayload();
     const result = handleIngress("telegram", parsed.body);
-    return Response.json({ ...result, task: projectTask(result.task) }, { status: 202 });
+    return ingressResponse(result);
   }
   if (req.method === "POST" && url.pathname === "/ingress/sentry") {
     const parsed = await parseJsonObject(req);

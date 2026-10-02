@@ -419,16 +419,21 @@ if (mode === "verbatim") {
   assert.equal(body.draft.fingerprint, "bound-gateway-1");
   assert.equal(body.draft.id, "bound-gateway-1");
   assert.equal(body.draft.status, "mock-draft");
-  assert.equal(body.draft.path, join(ISSUES_DIR, "sentry-bound-gateway-1.json"));
   assert.equal(body.draft.bodyTruncated, true);
   assert.equal(body.draft.bodyBytes, PAYLOAD_MAX_BYTES);
   // The projection never carries the payload itself.
   assert.equal("raw" in body.draft, false);
   assert.equal("body" in body.draft, false);
+  // ...nor the absolute path (plan 029): it embeds $HOME and the OS username on
+  // a route documented as unauthenticated. The stored copy still names it, so
+  // containment is asserted there instead.
+  assert.equal("path" in body.draft, false);
+  const draftPath = join(ISSUES_DIR, "sentry-bound-gateway-1.json");
 
   // And the file on disk holds the whole bounded draft, containment intact.
   const stored = readDraft("sentry-bound-gateway-1.json");
-  assert.equal(dirname(body.draft.path), ISSUES_DIR);
+  assert.equal(stored.path, draftPath);
+  assert.equal(dirname(stored.path), ISSUES_DIR);
   assert.equal(stored.bodyTruncated, true);
   assert(Buffer.byteLength(stored.raw as string, "utf8") <= PAYLOAD_MAX_BYTES);
 
@@ -443,7 +448,7 @@ if (mode === "verbatim") {
   // the input. Both copies are inside the bound, which is the point: an
   // uncapped 150 KB event would have written ~300 KB here, and the same event
   // at 2 MB wrote 8.4 MB before this cap existed.
-  const storedBytes = statSync(body.draft.path).size;
+  const storedBytes = statSync(draftPath).size;
   assert(storedBytes <= 2 * PAYLOAD_MAX_BYTES + 8 * 1024, `draft file is ${storedBytes} bytes`);
 
   // The second hole, reached the same unauthenticated way: a payload whose
@@ -469,7 +474,58 @@ if (mode === "verbatim") {
   assert(wideBodyBytes < ARGV_MAX_BYTES, `wide draft body is ${wideBodyBytes} bytes`);
   assert.equal(Buffer.byteLength(wideDraft.raw as string, "utf8"), PAYLOAD_MAX_BYTES);
 
-  detail = { responseBytes, storedBytes, serializedBytes };
+  // Every fixture above oversizes a field the *payload* cap already bounds, so
+  // none of them could have caught the response echoing an unbounded one. This
+  // is the field that is not bounded there: `fingerprintFor` returns the
+  // caller's `event_id` verbatim — it is the draft's identity, so it must — and
+  // `projectIssueDraft` copied it, making a 200 KB POST answer with ~400 KB.
+  // The reflection is now capped and says so; the stored identity is not.
+  const bigId = `bound-gateway-big-id-${"Z".repeat(200 * 1024)}`;
+  const idEvent = {
+    event_id: bigId,
+    project: "harness",
+    message: "TypeError: boom",
+    level: "error",
+  };
+  assert(
+    Buffer.byteLength(JSON.stringify(idEvent), "utf8") < 256 * 1024,
+    "oversized-id fixture must stay under the request ceiling",
+  );
+
+  const idResponse = await send("/ingress/sentry", idEvent);
+  assert.equal(idResponse.status, 202);
+  const idRaw = await idResponse.text();
+  const idBody = JSON.parse(idRaw);
+  const idResponseBytes = Buffer.byteLength(idRaw, "utf8");
+  assert(idResponseBytes < 4 * 1024, `oversized event_id answered with ${idResponseBytes} bytes`);
+  assert.equal(idRaw.includes("Z".repeat(1000)), false, "/ingress/sentry echoed the id");
+  assert.equal(idBody.draft.fingerprint, `${bigId.slice(0, HEADER_MAX_CHARS)}…`);
+  assert.equal(idBody.draft.id, idBody.draft.fingerprint);
+  assert.equal(idBody.draft.fingerprintTruncated, true);
+  assert.equal(idBody.draft.fingerprintBytes, Buffer.byteLength(bigId, "utf8"));
+  assert.equal(idBody.draft.idTruncated, true);
+  assert.equal(idBody.draft.idBytes, Buffer.byteLength(bigId, "utf8"));
+  // The same event on the sibling route, so the cap is the projection's and not
+  // one route's.
+  const bugsinkResponse = await send("/ingress/bugsink", idEvent);
+  assert.equal(bugsinkResponse.status, 202);
+  const bugsinkRaw = await bugsinkResponse.text();
+  assert(Buffer.byteLength(bugsinkRaw, "utf8") < 4 * 1024, "/ingress/bugsink echoed the id");
+  const bugsinkDraft = JSON.parse(bugsinkRaw).draft;
+  assert.equal(bugsinkDraft.fingerprintTruncated, true);
+  assert.equal(bugsinkDraft.fingerprint, idBody.draft.fingerprint);
+
+  // And the draft on disk still holds the whole id: two events sharing a
+  // 500-char prefix cannot collapse onto one draft, which is exactly why the
+  // cap is on the reflection and never inside `fingerprintFor`.
+  const { listIssueDrafts } = await import("../../src/issues.ts");
+  const idDraft = listIssueDrafts().find((d) => d.fingerprint === bigId);
+  assert(idDraft, "the oversized-id draft is on disk under its full fingerprint");
+  assert.equal(idDraft.fingerprint.length, bigId.length);
+  assert.equal(idDraft.id, bigId);
+  assert(dirname(idDraft.path!) === ISSUES_DIR, "the oversized-id draft stays contained");
+
+  detail = { responseBytes, storedBytes, serializedBytes, idResponseBytes };
 } else {
   throw new Error(`Unknown runner mode: ${mode}`);
 }

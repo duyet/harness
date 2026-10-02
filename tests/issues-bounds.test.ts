@@ -98,11 +98,16 @@ describe("issues directory bounds", { timeout: SLOW_MS }, () => {
 });
 
 describe("error ingress response", () => {
-  test("the /ingress/sentry 202 is bounded and carries fingerprint and path", () => {
+  test("the /ingress/sentry 202 is bounded for a capped payload and for an uncapped id", () => {
     const detail = run("gateway-202");
     expect(detail.responseBytes as number).toBeLessThan(4 * 1024);
     // The payload is stored twice in the draft, so the file costs about twice
     // the cap however large the request was.
     expect(detail.storedBytes as number).toBeLessThanOrEqual(2 * 96 * 1024 + 8 * 1024);
+    // Plan 030: the first fixture oversizes a field the payload cap already
+    // bounds, so on its own it could not tell an echoed 200 KB `event_id` from
+    // a bounded one. This is that case, and it is the one that used to answer
+    // a 200 KB POST with 400 KB.
+    expect(detail.idResponseBytes as number).toBeLessThan(4 * 1024);
   });
 });

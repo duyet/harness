@@ -51,12 +51,17 @@ async function accepted(path: string, body: Record<string, unknown>) {
     assert.equal(result.draft.source, source);
     assert.equal(result.draft.status, "mock-draft");
     assert.equal(result.draft.playbook, "desk:sentry-issues");
-    assert.equal(dirname(result.draft.path), ISSUES_DIR);
-    // The 202 answers with a projection, not the draft, so the payload is
-    // checked where it actually lives — on disk — rather than in the echo.
-    const stored = readJson(result.draft.path);
+    // The 202 answers with a projection, not the draft. The absolute path is
+    // not on it (plan 029: an unauthenticated route must not hand out
+    // $HOME/username), so the file is found by the name derived from the
+    // fingerprint and containment is asserted on the stored copy, which does
+    // record where it was written.
+    assert.equal("path" in result.draft, false);
+    const draftPath = join(ISSUES_DIR, `${source}-${result.draft.fingerprint}.json`);
+    const stored = readJson(draftPath);
+    assert.equal(stored.path, draftPath);
+    assert.equal(dirname(stored.path), ISSUES_DIR);
     assert.equal(stored.fingerprint, result.draft.fingerprint);
-    assert.equal(stored.path, result.draft.path);
     assert.deepEqual(stored.raw, body);
     assert.equal("raw" in result.draft, false);
     assert.equal("body" in result.draft, false);
