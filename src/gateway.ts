@@ -45,6 +45,12 @@ export type IngressEvent = {
   bodyBytes?: number;
   textTruncated?: boolean;
   textBytes?: number;
+  senderTruncated?: boolean;
+  senderBytes?: number;
+  channelTruncated?: boolean;
+  channelBytes?: number;
+  taskIdTruncated?: boolean;
+  taskIdBytes?: number;
 };
 
 // --- ingress state bounds ----------------------------------------------------
@@ -58,6 +64,42 @@ const INGRESS_BODY_MAX_BYTES = 4 * 1024;
 const INGRESS_TEXT_MAX_CHARS = 200;
 const INGRESS_QUEUE_MAX_EVENTS = 50;
 const INGRESS_QUEUE_MAX_BYTES = 2 * 1024 * 1024;
+
+// `sender` is a Matrix user id (`@alice:example.org`) or a Telegram username;
+// `channel` is a Matrix room id (`!abc:example.org`) or a Telegram chat id. Both
+// are short identifiers a real bridge emits in tens of characters, so 200 chars
+// leaves two orders of magnitude of headroom — no genuine envelope is ever
+// touched — while stopping a caller writing megabytes through a field that
+// exists only to say who spoke and where.
+const INGRESS_SENDER_MAX_CHARS = 200;
+const INGRESS_CHANNEL_MAX_CHARS = 200;
+
+// `taskId` is a different kind of field and is capped differently on purpose.
+// The two above are display values; this one is a *lookup key* — `resolveTask`
+// compares it against the task ids in the repo config, so cutting it would make
+// a real id silently stop matching and the message would fall through to the
+// freeform route instead of the task the sender asked for. The cap is therefore
+// set far above any id an operator would actually write (config ids are short
+// hand-authored strings) and truncation is expected never to occur; if it ever
+// does, `taskIdTruncated` says the id was cut rather than letting the mismatch
+// read as an unknown task.
+const INGRESS_TASK_ID_MAX_CHARS = 512;
+
+// The caps above bound what is *persisted*; nothing bounds what is *read*, and
+// they all run after the body has been buffered and JSON.parse'd in full. This
+// is the ceiling on the read: 64x the stored-body cap, set above what a real
+// envelope can be — a Matrix/Telegram message with quoting, and a Sentry or
+// Bugsink event with a stack trace and a long breadcrumb list, which the error
+// routes ingest and bound separately — so a legitimate payload is truncated
+// with a visible flag rather than refused, while one hostile POST still has a
+// hard stop.
+const INGRESS_REQUEST_MAX_BYTES = 256 * 1024;
+
+// The event/response key names a capped field writes. One list, so the shared
+// cap helper stays generic and the projection cannot drift from the type.
+type CapField = "text" | "sender" | "channel" | "taskId";
+
+type Capped = { value: string | null; truncated?: boolean; bytes?: number };
 
 function byteLength(value: string): number {
   return Buffer.byteLength(value, "utf8");
@@ -97,16 +139,39 @@ function capBody(raw: Record<string, unknown>): Pick<IngressEvent, "body" | "bod
   return { body: prefix, bodyTruncated: true, bodyBytes: bytes };
 }
 
+// The one cap primitive behind every stored ingress string: cut at `maxChars`,
+// append an ellipsis, mark the cut and record the original size. At or below
+// the threshold it returns the value untouched and no flags, so an ordinary
+// event's serialized shape stays byte-identical to before. Callers pick the
+// field's flag names back out through `capFlags`, because the same value is
+// capped at the normalization boundary but named at the event/projection one.
+function capString(value: string | null, maxChars: number): Capped {
+  if (value === null || value.length <= maxChars) return { value };
+  return { value: `${value.slice(0, maxChars)}…`, truncated: true, bytes: byteLength(value) };
+}
+
+// A capped field that is not visibly capped reads as data loss with no
+// explanation, so the `<field>Truncated` / `<field>Bytes` pair travels with it
+// onto the stored event and into the unauthenticated `/status` projection.
+function capFlags<F extends CapField>(
+  capped: Capped,
+  field: F,
+): Partial<Record<`${F}Truncated` | `${F}Bytes`, boolean | number>> {
+  if (!capped.truncated) return {};
+  return {
+    [`${field}Truncated`]: true,
+    [`${field}Bytes`]: capped.bytes,
+  } as Partial<Record<`${F}Truncated` | `${F}Bytes`, boolean | number>>;
+}
+
 // `text` is what the chat page header and `harness summary` display, so it is
 // capped on its own: letting the body budget cut it would truncate it at an
-// arbitrary offset chosen by key order.
+// arbitrary offset chosen by key order. Kept as a named wrapper because the
+// event construction site and the projection both refer to it by name.
 function capText(text: string | null): Pick<IngressEvent, "text" | "textTruncated" | "textBytes"> {
-  if (text === null || text.length <= INGRESS_TEXT_MAX_CHARS) return { text };
-  return {
-    text: `${text.slice(0, INGRESS_TEXT_MAX_CHARS)}…`,
-    textTruncated: true,
-    textBytes: byteLength(text),
-  };
+  const capped = capString(text, INGRESS_TEXT_MAX_CHARS);
+  if (!capped.truncated) return { text: capped.value };
+  return { text: capped.value, textTruncated: true, textBytes: capped.bytes };
 }
 
 // Count window first, then the byte budget, so a burst of large events cannot
@@ -137,12 +202,23 @@ function persistIngress(event: IngressEvent) {
   return { last: event, queued: trimmed.length };
 }
 
-function extractTaskId(raw: Record<string, unknown>, text: string | null): string | null {
-  if (typeof raw.taskId === "string" && raw.taskId) return raw.taskId;
-  if (typeof raw.task_id === "string" && raw.task_id) return raw.task_id;
-  if (!text) return null;
+// Every source of a taskId passes through the cap here rather than at the event
+// construction site, so no normalization path can be a bypass. The two direct
+// branches copy caller-supplied strings; the regex branch is bounded too, even
+// though it only ever scans `[a-zA-Z0-9_.:-]+` out of `text` — `text` reaches
+// this function uncapped (capping it is the event construction's job), so the
+// match is bounded only by the request-size ceiling and could otherwise store a
+// quarter-megabyte "task id".
+function extractTaskId(raw: Record<string, unknown>, text: string | null): Capped {
+  if (typeof raw.taskId === "string" && raw.taskId) {
+    return capString(raw.taskId, INGRESS_TASK_ID_MAX_CHARS);
+  }
+  if (typeof raw.task_id === "string" && raw.task_id) {
+    return capString(raw.task_id, INGRESS_TASK_ID_MAX_CHARS);
+  }
+  if (!text) return { value: null };
   const m = text.match(/(?:task:|\/run)\s*([a-zA-Z0-9_.:-]+)/i);
-  return m?.[1] ?? null;
+  return capString(m?.[1] ?? null, INGRESS_TASK_ID_MAX_CHARS);
 }
 
 function normalizeMatrix(raw: Record<string, unknown>) {
@@ -151,9 +227,12 @@ function normalizeMatrix(raw: Record<string, unknown>) {
     (typeof content.body === "string" && content.body) ||
     (typeof raw.body === "string" && raw.body) ||
     null;
-  const sender = typeof raw.sender === "string" ? raw.sender : null;
-  const channel = typeof raw.room_id === "string" ? raw.room_id : null;
-  return { text, sender, channel, taskId: extractTaskId(raw, text) };
+  return {
+    text,
+    sender: capString(typeof raw.sender === "string" ? raw.sender : null, INGRESS_SENDER_MAX_CHARS),
+    channel: capString(typeof raw.room_id === "string" ? raw.room_id : null, INGRESS_CHANNEL_MAX_CHARS),
+    taskId: extractTaskId(raw, text),
+  };
 }
 
 function normalizeTelegram(raw: Record<string, unknown>) {
@@ -170,12 +249,24 @@ function normalizeTelegram(raw: Record<string, unknown>) {
     null;
   const channel = chat.id != null ? String(chat.id) : null;
   const nested = { ...raw, ...message };
-  return { text, sender, channel, taskId: extractTaskId(nested, text) };
+  return {
+    text,
+    sender: capString(sender, INGRESS_SENDER_MAX_CHARS),
+    channel: capString(channel, INGRESS_CHANNEL_MAX_CHARS),
+    taskId: extractTaskId(nested, text),
+  };
 }
 
+// `sender` and `channel` are fixed literals here, so they are bounded by
+// construction; only the taskId can carry caller input.
 function normalizeChat(raw: Record<string, unknown>) {
   const text = typeof raw.text === "string" ? raw.text : typeof raw.body === "string" ? raw.body : null;
-  return { text, sender: "chat-ui", channel: "local", taskId: extractTaskId(raw, text) };
+  return {
+    text,
+    sender: capString("chat-ui", INGRESS_SENDER_MAX_CHARS),
+    channel: capString("local", INGRESS_CHANNEL_MAX_CHARS),
+    taskId: extractTaskId(raw, text),
+  };
 }
 
 export function handleIngress(source: "matrix" | "telegram" | "chat", raw: Record<string, unknown>) {
@@ -189,8 +280,8 @@ export function handleIngress(source: "matrix" | "telegram" | "chat", raw: Recor
   const defaultAdapter = config?.adapters?.default ?? config?.agent ?? "grok-build";
   let route: ReturnType<typeof resolveTask> | { error: string; defaultAdapter: string; freeform: true };
   let freeform = false;
-  if (norm.taskId) {
-    const resolved = resolveTask(norm.taskId);
+  if (norm.taskId.value) {
+    const resolved = resolveTask(norm.taskId.value);
     if (resolved.error) {
       freeform = true;
       route = { error: resolved.error, defaultAdapter, freeform: true };
@@ -205,13 +296,18 @@ export function handleIngress(source: "matrix" | "telegram" | "chat", raw: Recor
   const event: IngressEvent = {
     at: new Date().toISOString(),
     source,
-    taskId: norm.taskId,
+    taskId: norm.taskId.value,
     ...capText(norm.text),
-    sender: norm.sender,
-    channel: norm.channel,
+    sender: norm.sender.value,
+    channel: norm.channel.value,
     freeform,
     route,
     ...capBody(raw),
+    // The values above were already capped by their normalizer; these carry the
+    // flags that make a capped field visibly capped rather than quietly short.
+    ...capFlags(norm.taskId, "taskId"),
+    ...capFlags(norm.sender, "sender"),
+    ...capFlags(norm.channel, "channel"),
   };
   const saved = persistIngress(event);
   const adapterId =
@@ -223,10 +319,10 @@ export function handleIngress(source: "matrix" | "telegram" | "chat", raw: Recor
     source,
     queued: saved.queued,
     task: {
-      id: norm.taskId,
+      id: norm.taskId.value,
       text: norm.text,
-      sender: norm.sender,
-      channel: norm.channel,
+      sender: norm.sender.value,
+      channel: norm.channel.value,
       adapterId,
       freeform,
     },
@@ -390,10 +486,56 @@ type ParsedBody =
   | { ok: true; body: Record<string, unknown> }
   | { ok: false; response: Response };
 
+function payloadTooLarge(): Response {
+  return Response.json(
+    { ok: false, error: `request body exceeds ${INGRESS_REQUEST_MAX_BYTES} bytes` },
+    { status: 413 },
+  );
+}
+
+// Read the body under a byte ceiling, abandoning the stream the moment the
+// budget is blown rather than draining the rest of it. `req.json()` would
+// buffer the whole payload first, which is exactly the allocation this bounds;
+// `maxRequestBodySize` on `Bun.serve` is the outer layer of the same defense.
+async function readBoundedText(
+  req: Request,
+  maxBytes: number,
+): Promise<{ ok: true; text: string } | { ok: false }> {
+  const stream = req.body;
+  if (!stream) return { ok: true, text: "" };
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    bytes += value.byteLength;
+    if (bytes > maxBytes) {
+      await reader.cancel();
+      return { ok: false };
+    }
+    chunks.push(value);
+  }
+  return { ok: true, text: Buffer.concat(chunks).toString("utf8") };
+}
+
+// Three layers bound one unauthenticated request, and none of them is the
+// guarantee on its own: the Content-Length precheck here is a fast path that
+// refuses a truthful oversized request without reading it, the counted read
+// below is what actually bounds memory (a client may omit the header or lie
+// about it), and `Bun.serve`'s `maxRequestBodySize` rejects declared oversize
+// before the handler is entered at all.
 async function parseJsonObject(req: Request): Promise<ParsedBody> {
+  const declared = Number(req.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > INGRESS_REQUEST_MAX_BYTES) {
+    return { ok: false, response: payloadTooLarge() };
+  }
+  const read = await readBoundedText(req, INGRESS_REQUEST_MAX_BYTES);
+  if (!read.ok) return { ok: false, response: payloadTooLarge() };
+
   let parsed: unknown;
   try {
-    parsed = await req.json();
+    parsed = JSON.parse(read.text);
   } catch {
     return { ok: false, response: Response.json({ ok: false, error: "invalid JSON" }, { status: 400 }) };
   }
@@ -460,6 +602,18 @@ function projectEvent(event: IngressEvent | null): Record<string, unknown> | nul
   if (event.bodyTruncated) {
     projection.bodyTruncated = true;
     projection.bodyBytes = event.bodyBytes;
+  }
+  if (event.senderTruncated) {
+    projection.senderTruncated = true;
+    projection.senderBytes = event.senderBytes;
+  }
+  if (event.channelTruncated) {
+    projection.channelTruncated = true;
+    projection.channelBytes = event.channelBytes;
+  }
+  if (event.taskIdTruncated) {
+    projection.taskIdTruncated = true;
+    projection.taskIdBytes = event.taskIdBytes;
   }
   return projection;
 }
@@ -540,6 +694,9 @@ export function startGatewayServer() {
   const server = Bun.serve({
     hostname: bind.hostname,
     port: bind.port,
+    // Matches the ceiling parseJsonObject enforces, so a request declaring an
+    // oversized body is refused by the server before the handler is reached.
+    maxRequestBodySize: INGRESS_REQUEST_MAX_BYTES,
     fetch(req) {
       return handleGatewayRequest(req, bind);
     },
