@@ -209,7 +209,11 @@ function unexpected(name: string): never {
   throw new Error(`Unexpected side effect: ${name}`);
 }
 spyOn(Bun, "serve").mockImplementation(() => unexpected("Bun.serve"));
-spyOn(globalThis, "fetch").mockImplementation(() => unexpected("fetch"));
+// Bun's `typeof fetch` is the call signature plus a non-standard `preconnect`,
+// so a bare arrow is not a fetch. This stub refuses both, as it always has.
+spyOn(globalThis, "fetch").mockImplementation(
+  Object.assign(() => unexpected("fetch"), { preconnect: () => unexpected("fetch") }),
+);
 const { STATE_DIR } = await import("../../src/shared.ts");
 assert.equal(STATE_DIR, join(home, ".local", "state", "herdr-harness"));
 const SEEDED = new Set(["pre-spawned", "replace", "cleanup", "cleanup-dry", "cleanup-force", "spawn-cleanup-flag", "hang-cleanup", "cleanup-closed-tab", "cleanup-close-denied", "cleanup-relist-unreadable", "cleanup-discovery-fail", "replace-closed-tab"]);

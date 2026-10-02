@@ -12,7 +12,11 @@ function unexpected(name: string): never {
 }
 
 spyOn(Bun, "serve").mockImplementation(() => unexpected("Bun.serve"));
-spyOn(globalThis, "fetch").mockImplementation(() => unexpected("fetch"));
+// Bun's `typeof fetch` is the call signature plus a non-standard `preconnect`,
+// so a bare arrow is not a fetch. This stub refuses both, as it always has.
+spyOn(globalThis, "fetch").mockImplementation(
+  Object.assign(() => unexpected("fetch"), { preconnect: () => unexpected("fetch") }),
+);
 
 const { STATE_DIR, LAST_SUMMARY_FILE } = await import("../../src/shared.ts");
 assert.equal(STATE_DIR, join(home, ".local", "state", "herdr-harness"));

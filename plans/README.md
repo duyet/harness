@@ -81,7 +81,7 @@ Fresh post-016 review (Herdr pane `harness-improve-run4` + `/improve` orientatio
 
 **021 last** (or whenever) — additive only; do not let a red typecheck force `src/` edits in the same PR (see its STOP conditions).
 
-> **021 executed** at `9c6121c`+ and hit its STOP exactly as written. `tsconfig.json` and the `typecheck` script landed in `1f4df11`; `.github/workflows/test.yml` landed separately in `fe4f640` (the first push was rejected — the OAuth token lacked the `workflow` scope — and was re-pushed with a scoped token). `src/` was not touched to force green. The typecheck job ships `continue-on-error: true` against a 23-error baseline (3 in `src/gateway.ts`). Clearing it is [022](022-clear-typecheck-baseline.md).
+> **021 executed** at `9c6121c`+ and hit its STOP exactly as written. `tsconfig.json` and the `typecheck` script landed in `1f4df11`; `.github/workflows/test.yml` landed separately in `fe4f640` (the first push was rejected — the OAuth token lacked the `workflow` scope — and was re-pushed with a scoped token). `src/` was not touched to force green. The typecheck job shipped `continue-on-error: true` against a 23-error baseline (3 in `src/gateway.ts`). That baseline was cleared by **[022](022-clear-typecheck-baseline.md)**, which also dropped `continue-on-error`; 021 is closed.
 
 ## Recommended execution order
 
@@ -150,8 +150,8 @@ Prefer **007** and **008** first (integrity + security). 009–011 may follow in
 | 018 | Make `executeCleanup` idempotent (failed tab-close must not wedge spawns) | DONE | 006, 013 |
 | 019 | Write all harness state files atomically (temp + rename) | DONE | none |
 | 020 | Refuse interactive stdin for `harness issues ingest` | DONE | none |
-| 021 | Add a `typecheck` script and a one-file CI workflow | BLOCKED — both halves landed (`1f4df11` script + tsconfig, `fe4f640` CI workflow; STOP 2 cleared). Still blocked on STOP 1: tip has 23 type errors (3 in `src/gateway.ts`), no `src/` greenwash — CI typecheck job ships non-blocking. See 022 | 001 |
-| 022 | Clear the 23-error typecheck baseline, then enforce the gate | OPEN | 021 |
+| 021 | Add a `typecheck` script and a one-file CI workflow | DONE — landed partial at `1f4df11` (script + tsconfig) and `fe4f640` (CI workflow), completed by 022: typecheck is 0 and the job is a blocking gate | 001 |
+| 022 | Clear the 23-error typecheck baseline, then enforce the gate | DONE — 23 → 0 with no knob weakened; `continue-on-error` removed from the CI typecheck job. One follow-up filed (see below) | 021 |
 
 Status values: OPEN | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJECTED (with one-line rationale).
 
@@ -174,7 +174,11 @@ Status values: OPEN | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJE
 
 ### Filed by 021's STOP condition
 
-- Typecheck baseline: 23 errors, 3 in `src/gateway.ts`; weakening `strict` makes it worse, not better → **[022](022-clear-typecheck-baseline.md)**
+- Typecheck baseline: 23 errors, 3 in `src/gateway.ts`; weakening `strict` makes it worse, not better → **[022](022-clear-typecheck-baseline.md)** — shipped; baseline is 0 and the job gates.
+
+### Filed by 022
+
+- **`resolveTask` returns a merged type, not a discriminated pair** — `src/shared.ts:245` returns two object literals (a bare error, and the task + `adapterId` + `route` together) that inference collapses into one type whose `task` / `adapterId` / `route` come out *independently optional*. Every caller that has already checked `error` still reads its adapter id as possibly undefined; 022 absorbed that in `src/gateway.ts` with `?? defaultAdapter` / `?? null`, which is correct but treats the symptom. Annotating the return as `{error: string, ...} | {error: null, task, adapterId, route, ...}` is the real fix and was measured: it cascades to 11 sites in `src/cli.ts` (lines ~369, 393, 574, 738, 776, 848, 862), all of them `?.` / `??` / `!` guards that a discriminant would make unnecessary. S effort, type-only, no runtime change. Deferred out of 022 for scope, not difficulty.
 
 ### Run 3/4 vetted, still deferred (ranked below the five)
 

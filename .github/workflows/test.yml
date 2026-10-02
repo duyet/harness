@@ -18,14 +18,12 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: bun test
 
-  # Non-blocking while the tip has a known-red typecheck baseline. This job is
-  # here to make the debt visible and to catch *new* type errors; it is not yet
-  # a gate. Drop `continue-on-error` once plans/022 lands and the baseline is 0.
-  # See plans/021-typecheck-and-minimal-ci.md (STOP) and plans/022-clear-typecheck-baseline.md.
+  # A real gate. This job shipped non-blocking against a 23-error baseline and
+  # stops being one once plans/022 cleared it; see that plan and
+  # plans/021-typecheck-and-minimal-ci.md (STOP) for the history.
   typecheck:
     name: tsc --noEmit
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2

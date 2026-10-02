@@ -4,12 +4,28 @@
 
 ## Status
 
+**DONE.** `bun run typecheck` exits 0 and `.github/workflows/test.yml`'s `typecheck` job no longer sets `continue-on-error`.
+
 - **Priority:** P2
 - **Effort:** S–M
 - **Risk:** LOW–MED — mostly annotation/test-fixture work; the `src/` half touches three gateway sites
 - **Depends on:** [021](021-typecheck-and-minimal-ci.md) (shipped partial — `tsconfig.json` + `typecheck` script landed, workflow landed non-blocking)
 - **Category:** tests / dx
 - **Filed at:** `9c6121c` + plan 021's commit, 2026-10-02
+- **Executed:** 2026-10-02, against `a575f26`
+
+> **What landed.** All 23 errors cleared with `strict: true`, `strictNullChecks` and the DOM lib untouched; `tsconfig.json` is byte-identical to the 021 commit.
+>
+> - **`src/` (3, both real fixes).** `gateway.ts:292` — `capFlags` typed both key families as one `boolean | number` union, so a byte count could pass as a truncation flag; the flag is always `true` and the count always lands under `<field>Bytes`, and the tests plus the `/status` projection already assumed that, so the return type is now a mapped type that picks the two apart from `IngressEvent`. The single `as` left in the helper was already there and now states a narrower, true shape. `gateway.ts:396`/`437` — `handleIngress` re-derived `adapterId`/`routeObj` after the fact with `"adapterId" in route` guards, which TypeScript cannot narrow to a value; both are now read on the branch that establishes there is no error, with the fallbacks `resolveTask` itself applies. No behaviour change: the old guards were true exactly when the new assignments run.
+> - **B1 (8).** Kept the DOM lib; the `fetch` stubs now carry Bun's non-standard `preconnect` alongside the call signature, so they are real `typeof fetch` values rather than casts.
+> - **B2 (6).** Declaration merge in `tests/bun-test.d.ts`; `node_modules` untouched. Verified load-bearing — removing the file brings all six errors back.
+> - **B3 (6).** Genuine findings: a typed `readJson<T>()` accessor, `server.port ?? 0` behind the existing assertion, and a narrowing cast on the deliberately hostile `pick` cursor that keeps the hostile input.
+>
+> **No STOP was hit.** `gateway.ts:292` was confirmed against the on-disk shape before changing either side — `capString` returns a count that has always gone to `<field>Bytes`, never into the boolean — so this is a type-only fix, not a behaviour fix. `@types/bun` was not patched.
+>
+> **Follow-up filed** (not done here, out of scope): `resolveTask` in `src/shared.ts` infers one merged return type rather than a discriminated pair, which is the root cause of the `396`/`437` pair. Annotated properly it cascades to 11 type-only sites in `src/cli.ts`. Recorded under "Filed by 022" in `plans/README.md`.
+>
+> Step 6 (tightening toward canonical `noUncheckedIndexedAccess` / `noImplicitOverride` / `noFallthroughCasesInSwitch`) was not attempted — it is a separate, deliberate tightening, not part of clearing the baseline.
 
 ## Why this matters
 
@@ -74,10 +90,10 @@ All three are **type-shape** findings, not behaviour changes — 021's caller wa
 
 ## Done criteria
 
-- [ ] `bun run typecheck` exits 0
-- [ ] `.github/workflows/test.yml` no longer sets `continue-on-error` on the typecheck job
-- [ ] Any `src/` change is a real fix, not a cast added to silence the checker
-- [ ] `bun test` still green (169 tests / 22 files at the 021 commit)
+- [x] `bun run typecheck` exits 0
+- [x] `.github/workflows/test.yml` no longer sets `continue-on-error` on the typecheck job
+- [x] Any `src/` change is a real fix, not a cast added to silence the checker
+- [x] `bun test` still green (169 tests / 22 files at the 021 commit)
 
 ## STOP conditions
 

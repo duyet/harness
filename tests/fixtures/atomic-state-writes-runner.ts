@@ -27,8 +27,12 @@ function orphans(): string[] {
   return existsSync(STATE_DIR) ? readdirSync(STATE_DIR).filter((f) => f.includes(".tmp")) : [];
 }
 
-function readJson(path: string): unknown {
-  return JSON.parse(readFileSync(path, "utf8"));
+// The documents below are read back off disk, so a caller says which field it
+// is asserting on rather than treating the whole file as an object it may
+// dereference. `unknown` stays the default so the structural `deepEqual` probes
+// still compare the raw parse.
+function readJson<T = unknown>(path: string): T {
+  return JSON.parse(readFileSync(path, "utf8")) as T;
 }
 
 function orphanDrafts(): string[] {
@@ -70,7 +74,7 @@ assert.deepEqual(orphans(), [], "a failed write left a scratch file behind");
 
 // saveState: a bare writeFileSync to the final path before this plan.
 saveState({ started: true, startedAt: "2026-10-02T00:00:00.000Z", sessionId: "sess-atomic" });
-assert.equal(readJson(STATE_FILE).sessionId, "sess-atomic");
+assert.equal(readJson<{ sessionId?: string }>(STATE_FILE).sessionId, "sess-atomic");
 assert.deepEqual(orphans(), []);
 
 // saveSpawns, via saveSpawn: a truncated spawns.json is the sharp end of this
@@ -99,14 +103,14 @@ assert.equal(loadState().sessionId, "sess-recovered");
 // a torn draft reads as no draft, and "no draft" is exactly the state that
 // guard reads as "not published yet".
 const draft = ingestErrorEvent("sentry", EVENT);
-assert.equal(readJson(draft.path!).fingerprint, "atomic-draft-1");
+assert.equal(readJson<{ fingerprint?: string }>(draft.path!).fingerprint, "atomic-draft-1");
 assert.deepEqual(orphanDrafts(), []);
 assert.equal(listIssueDrafts().length, 1);
 const goodDraft = readFileSync(draft.path!, "utf8");
 writeFileSync(draft.path!, goodDraft.slice(0, 40));
 assert.equal(listIssueDrafts().length, 0, "today's reader drops a torn draft entirely");
 const redraft = ingestErrorEvent("sentry", EVENT);
-assert.equal(readJson(redraft.path!).fingerprint, "atomic-draft-1");
+assert.equal(readJson<{ fingerprint?: string }>(redraft.path!).fingerprint, "atomic-draft-1");
 assert.deepEqual(orphanDrafts(), []);
 
 // saveSpawns is the shared path behind saveSpawn/deleteSpawn; assert it

@@ -15,7 +15,9 @@
 - **Confidence:** HIGH (deferred explicitly from Runs 1–3 as "candidates for Run 4" once 001 proved value)
 - **Planned at:** commit `5fd3cf0`, 2026-10-02 (Run 4)
 
-> **Executed — partial, via STOP.** `tsconfig.json`, `package.json#scripts.typecheck` (+ `typescript`/`@types/bun` devDeps) and `.github/workflows/test.yml` all landed — the last in `fe4f640`, after the first push was rejected for lacking the token's `workflow` scope. The typecheck is **not green**: 23 errors, 3 in `src/gateway.ts`. The STOP condition held — no `src/` was edited to force green, and no knob was loosened to fake it (measured: `strict: false` is worse at 25; canonical `@tsconfig/bun` is 189). The CI typecheck job ships `continue-on-error: true`; the `test` job is a real blocking gate. Done-criteria boxes stay unticked. Follow-up: [022](022-clear-typecheck-baseline.md).
+> **Executed — partial, via STOP; closed by 022.** `tsconfig.json`, `package.json#scripts.typecheck` (+ `typescript`/`@types/bun` devDeps) and `.github/workflows/test.yml` all landed — the last in `fe4f640`, after the first push was rejected for lacking the token's `workflow` scope. The typecheck was **not green** at this plan's exit: 23 errors, 3 in `src/gateway.ts`. The STOP condition held — no `src/` was edited to force green, and no knob was loosened to fake it (measured: `strict: false` is worse at 25; canonical `@tsconfig/bun` is 189). The CI typecheck job shipped `continue-on-error: true`; the `test` job was a real blocking gate.
+>
+> **Both halves are now complete.** [022](022-clear-typecheck-baseline.md) cleared the 23 errors without touching a single `tsconfig.json` knob and removed `continue-on-error`, so the typecheck job is a real gate too. Its own boxes stay unticked because they were not true when this plan was handed back; the criteria are met as of 022.
 
 ## Why this matters
 
@@ -64,10 +66,12 @@ Inventory at `5fd3cf0`: `ls .github` → absent; `package.json` has no typecheck
 
 ## Done criteria
 
-- [ ] `bun run typecheck` exits 0 on tip
-- [ ] Workflow file present and runs test + typecheck
-- [ ] No `src/` behaviour changes
-- [ ] `plans/README.md` row updated on execute
+Met by [022](022-clear-typecheck-baseline.md), 2026-10-02 (this plan's own STOP barred `src/` edits, so they could not be met at this plan's exit):
+
+- [x] `bun run typecheck` exits 0 on tip
+- [x] Workflow file present and runs test + typecheck
+- [x] No `src/` behaviour changes
+- [x] `plans/README.md` row updated on execute
 
 ## STOP conditions
 

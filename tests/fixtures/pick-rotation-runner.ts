@@ -1,6 +1,9 @@
 import { strict as assert } from "node:assert";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+// Type-only, so it is erased and does not pull shared.ts in ahead of the
+// dynamic import below, which has to see the fixture's HOME.
+import type { State } from "../../src/shared.ts";
 
 // Seeds and inspects the two pieces of persisted state the pick rotation reads:
 // the ingress queue (whose events carry the freeform cursor) and state.json's
@@ -29,8 +32,14 @@ if (mode === "seed-queue") {
   console.log(JSON.stringify({ ok: true, mode, lastPicked: loadState().lastPicked ?? null }));
 } else if (mode === "set-last-picked") {
   // Plants a cursor the CLI would never produce: a stale timestamp, or an
-  // entry written before `eventAt` existed.
-  const planted = JSON.parse(payload ?? "null") as { lastPicked?: unknown } | null;
+  // entry written before `eventAt` existed. The payload is arbitrary JSON and
+  // is written through as-is on purpose — the fixture is proving that `pick`
+  // reads a cursor back without trusting it, so it must be able to plant one
+  // that does not match the declared shape. The cast states that intent; it is
+  // not a claim about what `pick` should accept.
+  const planted = JSON.parse(payload ?? "null") as
+    | (Pick<State, "lastPicked"> & Record<string, unknown>)
+    | null;
   saveState({ ...loadState(), ...(planted ?? {}) });
   console.log(JSON.stringify({ ok: true, mode }));
 } else {

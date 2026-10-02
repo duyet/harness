@@ -12,6 +12,7 @@ import {
   gatewayBind,
   lastDelivery,
   writeJsonAtomic,
+  type AdapterRoute,
   type LastDelivery,
 } from "./shared.ts";
 import { ingestErrorEvent, type IssueDraft } from "./issues.ts";
@@ -146,15 +147,27 @@ function capString(value: string | null, maxChars: number): Capped {
 // A capped field that is not visibly capped reads as data loss with no
 // explanation, so the `<field>Truncated` / `<field>Bytes` pair travels with it
 // onto the stored event and into the unauthenticated `/status` projection.
-function capFlags<F extends CapField>(
-  capped: Capped,
-  field: F,
-): Partial<Record<`${F}Truncated` | `${F}Bytes`, boolean | number>> {
+// The two key families are kept apart on purpose: the flag is always `true` and
+// the count always lands beside it under `<field>Bytes`, so their types are
+// picked from `IngressEvent` separately. Typing both as one `boolean | number`
+// union is what let a byte count pass as a truncation flag at the event site.
+type CapFlagFields<F extends CapField> = {
+  [K in `${F}Truncated`]?: IngressEvent[K];
+} & {
+  [K in `${F}Bytes`]?: IngressEvent[K];
+};
+
+function capFlags<F extends CapField>(capped: Capped, field: F): CapFlagFields<F> {
   if (!capped.truncated) return {};
   return {
     [`${field}Truncated`]: true,
     [`${field}Bytes`]: capped.bytes,
-  } as Partial<Record<`${F}Truncated` | `${F}Bytes`, boolean | number>>;
+    // The one assertion left in this helper, and it was here before this plan:
+    // a key computed from a generic `F` is a pattern template literal that the
+    // checker will not match against the mapped type. It states the shape the
+    // two lines above plainly have, which the previous `boolean | number` union
+    // did not.
+  } as CapFlagFields<F>;
 }
 
 // `text` is what the chat page header and `harness summary` display, so it is
@@ -276,6 +289,13 @@ export function handleIngress(source: "matrix" | "telegram" | "chat", raw: Recor
   const defaultAdapter = config?.adapters?.default ?? config?.agent ?? "grok-build";
   let route: ReturnType<typeof resolveTask> | { error: string; defaultAdapter: string; freeform: true };
   let freeform = false;
+  // `freeform` is false exactly when `route` is a resolved task, so the adapter
+  // and the route handed back to the caller are read here, while that is still
+  // known. Re-deriving them after the fact with an `"adapterId" in route` guard
+  // asks the same question in a form TypeScript cannot narrow to a value, which
+  // is how a `string | undefined` adapter id reached the execute gate.
+  let adapterId = defaultAdapter;
+  let routeObj: AdapterRoute | null = null;
   if (norm.taskId.value) {
     const resolved = resolveTask(norm.taskId.value);
     if (resolved.error) {
@@ -283,6 +303,16 @@ export function handleIngress(source: "matrix" | "telegram" | "chat", raw: Recor
       route = { error: resolved.error, defaultAdapter, freeform: true };
     } else {
       route = resolved;
+      // `resolveTask` states its failure and its success with one object type,
+      // so `task` / `adapterId` / `route` come out as independently-optional
+      // fields and read as possibly absent even on this branch, where they were
+      // returned together. The fallbacks are the ones `resolveTask` itself
+      // applies when it builds them: an adapter with no id runs under the config
+      // default, and a task with no route has no route. Making the return type a
+      // real discriminated pair is the proper fix, and it reaches every caller
+      // of `resolveTask`, so it is filed as a follow-up rather than done here.
+      adapterId = resolved.adapterId ?? defaultAdapter;
+      routeObj = resolved.route ?? null;
     }
   } else {
     freeform = true;
@@ -306,9 +336,6 @@ export function handleIngress(source: "matrix" | "telegram" | "chat", raw: Recor
     ...capFlags(norm.channel, "channel"),
   };
   const saved = persistIngress(event);
-  const adapterId =
-    !freeform && "adapterId" in route ? route.adapterId : defaultAdapter;
-  const routeObj = !freeform && "route" in route ? route.route : null;
 
   return {
     ok: true,

@@ -18,12 +18,17 @@ spyOn(process, "kill").mockImplementation(() => unexpected("process.kill"));
 spyOn(Bun, "serve").mockImplementation(() => unexpected("Bun.serve"));
 
 let healthChecks = 0;
-spyOn(globalThis, "fetch").mockImplementation(async (input) => {
-  assert.equal(mode, "launch");
-  assert.equal(String(input), "http://127.0.0.1:8787/health");
-  healthChecks++;
-  return Response.json({ ok: true });
-});
+// Bun's `typeof fetch` is the call signature plus a non-standard `preconnect`,
+// so an async arrow alone is not a fetch; the health-poll stub never reaches
+// the second one.
+spyOn(globalThis, "fetch").mockImplementation(
+  Object.assign(async (input: URL | RequestInfo) => {
+    assert.equal(mode, "launch");
+    assert.equal(String(input), "http://127.0.0.1:8787/health");
+    healthChecks++;
+    return Response.json({ ok: true });
+  }, { preconnect: () => unexpected("preconnect") }),
+);
 
 const { STATE_DIR, GATEWAY_PID_FILE, loadConfig } = await import("../../src/shared.ts");
 assert.equal(STATE_DIR, join(home, ".local", "state", "herdr-harness"));

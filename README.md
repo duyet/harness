@@ -248,9 +248,9 @@ bun run test
 bun run typecheck
 ```
 
-> **Known-red baseline.** This does **not** currently pass. Plan 021 added it and hit its own STOP condition rather than weaken `strict` to force a green: the tree has **23 errors, 3 in `src/gateway.ts`**. `strict: false` is *worse* (25), and the canonical `@tsconfig/bun` config is far worse (189) — so the errors are real findings, not strictness noise. `bun test` does not typecheck and is unaffected. Full inventory and the fix order: [plans/022-clear-typecheck-baseline.md](plans/022-clear-typecheck-baseline.md).
+> **Passes.** Plan 021 added the script and hit its own STOP condition rather than weaken `strict` to force a green, leaving 23 errors (3 in `src/gateway.ts`); plan 022 cleared all 23 without touching a `tsconfig.json` knob. `strict: true` and the DOM lib are unchanged — the errors were real findings, and they are fixed rather than configured away. What each fix was: [plans/022-clear-typecheck-baseline.md](plans/022-clear-typecheck-baseline.md).
 
-CI (`.github/workflows/test.yml`) runs `bun test` as a blocking gate and the typecheck non-blocking (`continue-on-error`) until that baseline is cleared.
+CI (`.github/workflows/test.yml`) runs both `bun test` and this typecheck as blocking gates.
 
 ## Not in this MVP
 

@@ -33,7 +33,11 @@ if (!live) {
     throw new Error(`Unexpected side effect: ${name}`);
   };
   spyOn(Bun, "serve").mockImplementation(() => unexpected("Bun.serve"));
-  spyOn(globalThis, "fetch").mockImplementation(() => unexpected("fetch"));
+  // Bun's `typeof fetch` is the call signature plus a non-standard `preconnect`,
+  // so a bare arrow is not a fetch. This stub refuses both, as it always has.
+  spyOn(globalThis, "fetch").mockImplementation(
+    Object.assign(() => unexpected("fetch"), { preconnect: () => unexpected("fetch") }),
+  );
 }
 
 const { STATE_DIR, INGRESS_QUEUE_FILE, LAST_INGRESS_FILE } = await import("../../src/shared.ts");
@@ -323,7 +327,10 @@ if (mode === "verbatim") {
   process.env.HARNESS_GATEWAY_PORT = "0";
   const server = startGatewayServer();
   console.error = quiet;
-  const port = server.port;
+  // Bun reports the port it actually bound, which is optional until the listener
+  // is up; an absent one is not a port, and the assertion below rejects it as
+  // the same failure it always was.
+  const port = server.port ?? 0;
   assert(port > 0, "expected an ephemeral port");
 
   // Loopback only; no name resolution and nothing outside the fixture.
