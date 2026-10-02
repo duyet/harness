@@ -269,6 +269,11 @@ function cmdManager() {
 
 function cmdManagerStatus() {
   const { path: configPath, config } = loadConfig();
+  // Sorted by `at` so the listing is stable and diffable between runs. Ties keep
+  // their insertion order, since Array#sort is stable.
+  const spawns = Object.values(loadSpawns().spawns).sort((a, b) =>
+    a.at < b.at ? -1 : a.at > b.at ? 1 : 0,
+  );
   printJson({
     ok: true,
     version: VERSION,
@@ -278,6 +283,8 @@ function cmdManagerStatus() {
     defaultAdapter: config?.adapters?.default ?? config?.agent ?? null,
     adapters: config?.adapters?.routes ?? {},
     tasks: config?.tasks ?? [],
+    spawns,
+    spawnCount: spawns.length,
   });
 }
 
@@ -615,6 +622,14 @@ function cmdManagerSpawn() {
 
   const argvFor = (i: number) => intendedSpawnCommands(resolved, ctx)[i].slice(1);
 
+  // Echoable recovery commands for a spawn that failed after its first step.
+  // Cleanup rediscovers tabs/worktrees live and only falls back to the record,
+  // so it is best-effort: it can report `cleaned: false` and leave the record.
+  const recoverFor = (task: string) => [
+    `harness manager cleanup ${task} --execute`,
+    `harness manager spawn ${task} --replace`,
+  ];
+
   const wtStep = runHerdr(herdr.bin, argvFor(0));
   results.push(wtStep);
   if (wtStep.status !== 0) {
@@ -633,13 +648,19 @@ function cmdManagerSpawn() {
   if (!ctx.workspaceId || !ctx.worktreePath) {
     return finish(false, {
       error: "could not parse worktree/workspace ids from herdr worktree create output",
+      hint: "herdr exited 0 but its worktree/workspace ids were unreadable, so a worktree may be on disk and a partial record was saved; run `harness manager status` to see it, then re-run with --replace or `harness manager cleanup <taskId> --execute` (cleanup may not find an unparsed worktree)",
+      recover: recoverFor(taskId!),
     });
   }
 
   const tabStep = runHerdr(herdr.bin, argvFor(1));
   results.push(tabStep);
   if (tabStep.status !== 0) {
-    return finish(false, { error: "herdr tab create failed" });
+    return finish(false, {
+      error: "herdr tab create failed",
+      hint: "the worktree was created before this step failed, so a worktree is on disk with no child tab; re-run with --replace or `harness manager cleanup <taskId> --execute` (cleanup reports `cleaned: false` if it finds nothing)",
+      recover: recoverFor(taskId!),
+    });
   }
   const tabResult = herdrResult(tabStep);
   ctx.paneId = tabResult?.root_pane?.pane_id;
@@ -649,6 +670,8 @@ function cmdManagerSpawn() {
   if (!ctx.paneId) {
     return finish(false, {
       error: "could not parse pane id from herdr tab create output",
+      hint: "the worktree and tab were created but the pane id was unreadable, so a worktree and tab are on disk with no agent; re-run with --replace or `harness manager cleanup <taskId> --execute` (cleanup may not match an unparsed pane)",
+      recover: recoverFor(taskId!),
     });
   }
 
@@ -657,7 +680,11 @@ function cmdManagerSpawn() {
   spawn.agentName = spec.name;
   saveSpawn(spawn);
   if (agentStep.status !== 0) {
-    return finish(false, { error: "herdr agent start failed" });
+    return finish(false, {
+      error: "herdr agent start failed",
+      hint: "the worktree and tab were created before this step failed, so a worktree and tab are on disk with no agent running; re-run with --replace or `harness manager cleanup <taskId> --execute` (cleanup closes the tab and removes the worktree if it finds them)",
+      recover: recoverFor(taskId!),
+    });
   }
   finish(true, { agent: spec });
 }

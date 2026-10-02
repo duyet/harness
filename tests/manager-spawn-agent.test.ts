@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createFixture } from "./helpers.ts";
@@ -12,6 +12,24 @@ function spawnsFile() {
 
 function readSpawns() {
   return JSON.parse(readFileSync(spawnsFile(), "utf8")).spawns;
+}
+
+function callsFile() {
+  return join(fixture.root, "manager-calls.json");
+}
+
+// `manager status` reads config + spawns.json only, so it goes through the CLI
+// directly instead of the spawn runner, which asserts a recording herdr run.
+function runStatus() {
+  const child = fixture.runCli(["manager", "status"]);
+  expect(child.stderr).toBe("");
+  expect(child.exit).toBe(0);
+  return JSON.parse(child.stdout);
+}
+
+function writeSpawns(spawns: Record<string, unknown>) {
+  mkdirSync(join(fixture.home, ".local", "state", "herdr-harness"), { recursive: true });
+  writeFileSync(spawnsFile(), `${JSON.stringify({ spawns }, null, 2)}\n`);
 }
 
 function worktreeArgs() {
@@ -125,6 +143,14 @@ describe("manager spawn child tab/agent", () => {
     expect(result.calls).toEqual([["--version"], worktreeArgs(), tabArgs("w1")]);
     // Partial progress is persisted so cleanup can find the worktree.
     expect(readSpawns()["fixture-task"]).toMatchObject({ workspaceId: "w1", tabId: "w1:t1" });
+    // A worktree is on disk with no child tab: the recovery wording says so.
+    expect(result.json.hint).toContain("harness manager cleanup");
+    expect(result.json.hint).toContain("--replace");
+    expect(result.json.hint).toContain("no child tab");
+    expect(result.json.recover).toEqual([
+      "harness manager cleanup fixture-task --execute",
+      "harness manager spawn fixture-task --replace",
+    ]);
   });
 
   test("agent start failure yields ok:false and exit 1 after earlier steps", () => {
@@ -134,6 +160,14 @@ describe("manager spawn child tab/agent", () => {
     expect(result.json.error).toBe("herdr agent start failed");
     expect(result.json.results).toHaveLength(3);
     expect(readSpawns()["fixture-task"]).toMatchObject({ tabId: "w1:t2", paneId: "w1:t2:p1" });
+    // Worktree and tab are both on disk by now, so both are named.
+    expect(result.json.hint).toContain("harness manager cleanup");
+    expect(result.json.hint).toContain("--replace");
+    expect(result.json.hint).toContain("worktree and tab are on disk");
+    expect(result.json.recover).toEqual([
+      "harness manager cleanup fixture-task --execute",
+      "harness manager spawn fixture-task --replace",
+    ]);
   });
 
   test("existing worktree failure points at --replace/--cleanup", () => {
@@ -141,8 +175,11 @@ describe("manager spawn child tab/agent", () => {
     expect(result.exit).toBe(1);
     expect(result.json.ok).toBe(false);
     expect(result.json.error).toBe("herdr worktree create failed");
-    expect(result.json.hint).toContain("--replace");
-    expect(result.json.hint).toContain("cleanup");
+    // Exact text: this branch predates plan 011 and must not drift.
+    expect(result.json.hint).toBe(
+      "if a worktree/tab already exists for this task, re-run with --replace or `harness manager cleanup <taskId>` first",
+    );
+    expect(result.json.recover).toBeUndefined();
     expect(result.calls).toEqual([["--version"], worktreeArgs()]);
   });
 
@@ -244,5 +281,62 @@ describe("manager cleanup / replace", () => {
       tabId: "w1:t2",
       paneId: "w1:t2:p1",
     });
+  });
+});
+
+describe("manager status spawns", () => {
+  test("reports no spawns and no count change to the config fields", () => {
+    expect(existsSync(spawnsFile())).toBe(false);
+    const json = runStatus();
+    expect(json).toMatchObject({ ok: true, spawns: [], spawnCount: 0 });
+    // Every pre-existing field is still present and unchanged.
+    expect(typeof json.version).toBe("string");
+    expect(json.configPath).toBe(join(fixture.cwd, ".herdr-harness.json"));
+    expect(json.name).toBeNull();
+    expect(json.soul).toBeNull();
+    expect(json.defaultAdapter).toBe("fixture-adapter");
+    expect(json.adapters).toEqual({
+      "fixture-adapter": { kind: "grok", model: "grok-build", flags: ["--verbose"] },
+      anyr: { kind: "anyr", via: "claude" },
+    });
+    expect(json.tasks.map((t: { id: string }) => t.id)).toEqual(["fixture-task", "anyr-task"]);
+    // Status reports stored state; it never shells out to herdr.
+    expect(existsSync(callsFile())).toBe(false);
+  });
+
+  test("lists the record a successful spawn wrote", () => {
+    const spawn = run("success");
+    expect(spawn.json.ok).toBe(true);
+    const json = runStatus();
+    expect(json.spawnCount).toBe(1);
+    expect(json.spawns).toHaveLength(1);
+    expect(json.spawns[0]).toMatchObject({
+      taskId: "fixture-task",
+      workspaceId: "w1",
+      tabId: "w1:t2",
+      paneId: "w1:t2:p1",
+    });
+    // Still exactly the four calls the spawn made — status added none.
+    expect(JSON.parse(readFileSync(callsFile(), "utf8"))).toEqual(spawn.calls);
+  });
+
+  test("reports zero spawns again after a cleanup deleted the record", () => {
+    const cleanup = run("cleanup");
+    expect(cleanup.json.cleanup.cleaned).toBe(true);
+    expect(readSpawns()["fixture-task"]).toBeUndefined();
+    const json = runStatus();
+    expect(json.spawns).toEqual([]);
+    expect(json.spawnCount).toBe(0);
+    expect(JSON.parse(readFileSync(callsFile(), "utf8"))).toEqual(cleanup.calls);
+  });
+
+  test("sorts records by timestamp", () => {
+    writeSpawns({
+      "later-task": { taskId: "later-task", workspaceId: "w2", at: "2026-02-01T00:00:00.000Z" },
+      "earlier-task": { taskId: "earlier-task", workspaceId: "w1", at: "2026-01-01T00:00:00.000Z" },
+    });
+    const json = runStatus();
+    expect(json.spawns.map((s: { taskId: string }) => s.taskId)).toEqual(["earlier-task", "later-task"]);
+    expect(json.spawnCount).toBe(2);
   });
 });
