@@ -1181,10 +1181,24 @@ async function cmdIssues() {
   process.exit(1);
 }
 
-function loadIngressQueue(): Array<{ freeform?: boolean; taskId?: string | null; text?: string | null; at?: string; source?: string }> {
+type IngressQueueEvent = {
+  freeform?: boolean;
+  taskId?: string | null;
+  text?: string | null;
+  at?: string;
+  source?: string;
+};
+
+function loadIngressQueue(): IngressQueueEvent[] {
   if (!existsSync(INGRESS_QUEUE_FILE)) return [];
   try {
-    return JSON.parse(readFileSync(INGRESS_QUEUE_FILE, "utf8"));
+    // Parsing is not checking: `null`, `{}`, `[]` and `"x"` all come back from
+    // `JSON.parse` and would escape the catch below, so the array check has to
+    // be beside the parse. Without it a wrong-shaped queue reaches
+    // `queue.filter(...)` in `cmdPick` and throws a raw TypeError out of the
+    // command — the CLI's own equivalent of the gateway's 500.
+    const parsed: unknown = JSON.parse(readFileSync(INGRESS_QUEUE_FILE, "utf8"));
+    return Array.isArray(parsed) ? (parsed as IngressQueueEvent[]) : [];
   } catch {
     return [];
   }

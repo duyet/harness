@@ -3,7 +3,7 @@ import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { spyOn } from "bun:test";
 
-const [mode, home, cwd] = process.argv.slice(2);
+const [mode, home, cwd, payload] = process.argv.slice(2);
 assert.equal(process.env.HOME, home);
 assert.equal(process.cwd(), cwd);
 
@@ -18,7 +18,7 @@ spyOn(globalThis, "fetch").mockImplementation(
   Object.assign(() => unexpected("fetch"), { preconnect: () => unexpected("fetch") }),
 );
 
-const { STATE_DIR, INGRESS_QUEUE_FILE, LAST_INGRESS_FILE, LAST_DELIVERY_FILE } = await import("../../src/shared.ts");
+const { STATE_DIR, INGRESS_QUEUE_FILE, LAST_INGRESS_FILE, LAST_DELIVERY_FILE, ISSUES_DIR } = await import("../../src/shared.ts");
 assert.equal(STATE_DIR, join(home, ".local", "state", "herdr-harness"));
 const { handleGatewayRequest } = await import("../../src/gateway.ts");
 const bind = { hostname: "127.0.0.1", port: 8787 };
@@ -287,6 +287,43 @@ if (mode === "verbatim") {
   );
   assert.equal(queue.length < QUEUE_MAX_EVENTS, true);
   detail = { kept: queue.length, queueBytes: sizeOf(INGRESS_QUEUE_FILE) };
+} else if (mode === "plant-queue" || mode === "plant-last") {
+  // Written through as raw bytes, because the whole point of the fixture is
+  // that the file reaches the reader exactly as planted — including as
+  // something `JSON.parse` accepts but the caller cannot use.
+  mkdirSync(STATE_DIR, { recursive: true });
+  writeFileSync(mode === "plant-queue" ? INGRESS_QUEUE_FILE : LAST_INGRESS_FILE, payload ?? "");
+  detail = { planted: payload };
+} else if (mode === "plant-drafts") {
+  mkdirSync(ISSUES_DIR, { recursive: true });
+  const files = JSON.parse(payload ?? "{}") as Record<string, string>;
+  for (const [name, content] of Object.entries(files)) writeFileSync(join(ISSUES_DIR, name), content);
+  detail = { planted: Object.keys(files).sort() };
+} else if (mode === "shape-chat") {
+  // `/chat` persists inside the unauthenticated handler, so a wrong-shaped
+  // queue used to surface here as Bun's HTML 500 rather than as an answer.
+  const planted = readFileSync(INGRESS_QUEUE_FILE, "utf8");
+  const response = await request("/chat", "POST", JSON.stringify({ text: "after a bad queue" }));
+  assert.equal(response.status, 200, `planted ${planted}`);
+  assert.match(response.headers.get("content-type") ?? "", /application\/json/, planted);
+  const result = await response.json();
+  assert.equal(result.ok, true, planted);
+  // The guard stood the file down to the empty queue, so the event appended to
+  // `[]` and the file is an array again rather than the planted bytes.
+  const repaired = readJson(INGRESS_QUEUE_FILE);
+  assert.equal(Array.isArray(repaired), true, `queue is still not an array after ${planted}`);
+  assert.equal(repaired.at(-1).text, "after a bad queue");
+  detail = { planted };
+} else if (mode === "shape-status") {
+  const response = await request("/status");
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get("content-type") ?? "", /application\/json/);
+  const result = await response.json();
+  assert.equal(result.ok, true);
+  // Reported rather than asserted here: `{}` is a record and legitimately
+  // projects to an all-undefined event, the same rule `lastDelivery` applies,
+  // while everything the reader cannot use must come back as "no last event".
+  detail = { lastEvent: result.lastEvent };
 } else {
   throw new Error(`Unknown runner mode: ${mode}`);
 }

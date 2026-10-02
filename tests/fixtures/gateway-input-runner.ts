@@ -223,6 +223,65 @@ if (mode === "happy") {
     }, path);
     assert.deepEqual(snapshot(), before, path);
   }
+} else if (mode === "depth") {
+  // The nesting ceiling, mirrored from src/gateway.ts; keep the two in step.
+  const MAX_DEPTH = 64;
+  // `levels` nested containers, the request body's own level being 1 — the
+  // same count `exceedsJsonDepth` makes. `tag` rides along as an `event_id` so
+  // the two error routes key each payload to its own draft: without it the
+  // fingerprint falls back to a 200-char prefix of the serialization, which
+  // 40 levels of nesting already fills. It is set on the outermost object
+  // rather than in a wrapper, so it adds a key but not a level.
+  function nested(levels: number, tag: string): Record<string, unknown> {
+    let node: Record<string, unknown> = { message: tag };
+    for (let i = 1; i < levels; i += 1) node = { n: node };
+    node.event_id = tag;
+    return node;
+  }
+
+  assert.equal(existsSync(STATE_DIR), false, "fixture must start without state");
+
+  // At and below the ceiling every route takes its ordinary path, byte for
+  // byte as before: this is the half of the contract that must not move.
+  // From 2 up, because a depth-1 body is `{message: <string>}`, which
+  // `telegramShape` rejects on its own terms — that is the pre-existing
+  // "invalid payload shape" rule the `invalid` mode covers, not a depth one.
+  for (const levels of [2, 8, 32, MAX_DEPTH - 1, MAX_DEPTH]) {
+    for (const path of routes) await accepted(path, nested(levels, `depth-${levels}`));
+  }
+  const stored = snapshot();
+  assert.notDeepEqual(stored, null, "accepted payloads must have been stored");
+
+  async function tooDeep(path: string, body: string) {
+    const label = `${path} (${Buffer.byteLength(body, "utf8")} bytes)`;
+    const response = await request(path, "POST", body);
+    assert.equal(response.status, 400, label);
+    assert.match(response.headers.get("content-type") ?? "", /application\/json/, label);
+    assert.deepEqual(await response.json(), { ok: false, error: "JSON nesting too deep" }, label);
+    // The refusal is upstream of the first write, so it costs the route nothing.
+    assert.deepEqual(snapshot(), stored, `${label}: a refused request wrote state`);
+  }
+
+  for (const levels of [MAX_DEPTH + 1, 500]) {
+    for (const path of routes) await tooDeep(path, JSON.stringify(nested(levels, `deep-${levels}`)));
+  }
+
+  // The plan's own reproduction: ~40,000 levels in 80,006 bytes — under the
+  // 256 KB ceiling and under every other check here, which is exactly why it
+  // reached `capBody`'s `JSON.stringify` and threw a `RangeError` into Bun's
+  // HTML 500 page. The two assertions below are the premise of the regression:
+  // if a future engine parses or serializes this cleanly, the reproducer is
+  // stale and the number needs raising rather than the test quietly weakening.
+  const crash = `{"d":${"[".repeat(40_000)}${"]".repeat(40_000)}}`;
+  assert(Buffer.byteLength(crash, "utf8") < 256 * 1024, "the reproducer must stay under the byte ceiling");
+  assert.doesNotThrow(() => JSON.parse(crash), "parsing was never the failure; serializing was");
+  assert.throws(() => JSON.stringify(JSON.parse(crash)), RangeError, "the reproducer must still defeat JSON.stringify");
+  for (const path of routes) await tooDeep(path, crash);
+
+  // A deep payload that also satisfies a route's own shape check is still
+  // refused: the depth gate runs before normalization, not instead of it.
+  await tooDeep("/ingress/telegram", JSON.stringify({ message: { chat: { id: [nested(200, "shape")] }, from: { username: "deep" } } }));
+  await tooDeep("/ingress/matrix", JSON.stringify({ content: { body: nested(200, "shape") } }));
 } else {
   throw new Error(`Unknown runner mode: ${mode}`);
 }

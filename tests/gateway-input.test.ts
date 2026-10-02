@@ -46,6 +46,14 @@ describe("gateway JSON input (isolated, no sockets)", () => {
     run("compatible");
   });
 
+  test("deeply nested JSON is refused with the 400 envelope and writes no state", () => {
+    // At and below the ceiling every route is unchanged; past it all five
+    // answer the documented envelope instead of Bun's HTML 500 page. The
+    // payload that used to crash is 40,000 levels in 80,006 bytes — well
+    // under the 256 KB ceiling, which is why no byte bound caught it.
+    run("depth");
+  });
+
   test("storage failures are not relabeled as client errors", () => {
     run("storage");
   });

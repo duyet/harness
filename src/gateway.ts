@@ -108,10 +108,28 @@ function byteLength(value: string): number {
   return Buffer.byteLength(value, "utf8");
 }
 
-function readJsonFile<T>(path: string, fallback: T): T {
+// What shape a state file may hold is a per-file question, so it is answered
+// per file. The reader could not answer it before, because `null`, `{}`, `[]`
+// and `"x"` all survive `JSON.parse` and every one of them escaped the
+// fallback that guards a torn or corrupt file.
+function isIngressQueue(value: unknown): value is IngressEvent[] {
+  return Array.isArray(value);
+}
+
+function isIngressEvent(value: unknown): value is IngressEvent {
+  return isRecord(value);
+}
+
+// The caller states the shape; the reader owns the fallback. The previous
+// `as T` asserted the shape without checking it, so a wrong-shaped file
+// arrived at the caller's `.push` / `.filter` as the wrong type. This is the
+// same check `lastDelivery` and `readStoredDraft` already do beside their own
+// parse — it just lives with the fallback too.
+function readJsonFile<T>(path: string, fallback: T, isValid: (v: unknown) => v is T): T {
   if (!existsSync(path)) return fallback;
   try {
-    return JSON.parse(readFileSync(path, "utf8")) as T;
+    const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+    return isValid(parsed) ? parsed : fallback;
   } catch {
     return fallback;
   }
@@ -204,7 +222,7 @@ function trimQueue(queue: IngressEvent[]): IngressEvent[] {
 function persistIngress(event: IngressEvent) {
   mkdirSync(STATE_DIR, { recursive: true });
   writeJsonAtomic(LAST_INGRESS_FILE, event);
-  const queue = readJsonFile<IngressEvent[]>(INGRESS_QUEUE_FILE, []);
+  const queue = readJsonFile<IngressEvent[]>(INGRESS_QUEUE_FILE, [], isIngressQueue);
   queue.push(event);
   const trimmed = trimQueue(queue);
   writeJsonAtomic(INGRESS_QUEUE_FILE, trimmed);
@@ -542,12 +560,48 @@ async function readBoundedText(
   return { ok: true, text: Buffer.concat(chunks).toString("utf8") };
 }
 
-// Three layers bound one unauthenticated request, and none of them is the
+// Real Matrix / Telegram / Sentry payloads nest about ten deep, so 64 is far
+// above any real traffic. Past this depth the only thing a request can do is
+// blow the engine's call stack in a `JSON.stringify` downstream — `capBody`
+// below and the draft body in `buildDraft` both serialize the parsed value —
+// which turns a documented 400 into Bun's HTML 500 page. Bounding it at the one
+// gate that already owns the request-shape contract fixes all five POST routes
+// at once, and reaches `buildDraft` without touching `src/issues.ts`.
+const MAX_JSON_DEPTH = 64;
+
+function isContainer(value: unknown): value is object {
+  return typeof value === "object" && value !== null;
+}
+
+// True when `value` nests containers more than `maxDepth` deep. The top-level
+// value counts as depth 1, and only objects and arrays count at all: a scalar
+// leaf cannot nest further, so counting it would quietly make the documented
+// ceiling mean "63 containers" instead of 64.
+function exceedsJsonDepth(value: unknown, maxDepth: number): boolean {
+  if (!isContainer(value)) return false;
+  let frontier: object[] = [value];
+  for (let depth = 1; frontier.length > 0; depth += 1) {
+    if (depth > maxDepth) return true;
+    const next: object[] = [];
+    for (const node of frontier) {
+      const children: unknown[] = Array.isArray(node) ? node : Object.values(node);
+      for (const child of children) {
+        if (isContainer(child)) next.push(child);
+      }
+    }
+    frontier = next;
+  }
+  return false;
+}
+
+// Four layers bound one unauthenticated request, and none of them is the
 // guarantee on its own: the Content-Length precheck here is a fast path that
 // refuses a truthful oversized request without reading it, the counted read
 // below is what actually bounds memory (a client may omit the header or lie
 // about it), and `Bun.serve`'s `maxRequestBodySize` rejects declared oversize
-// before the handler is entered at all.
+// before the handler is entered at all. None of the three bounds depth — 80 KB
+// of 40,000 two-byte levels is well under the byte ceiling and still
+// serializes into a `RangeError` — so the walk above is the fourth.
 async function parseJsonObject(req: Request): Promise<ParsedBody> {
   const declared = Number(req.headers.get("content-length"));
   if (Number.isFinite(declared) && declared > INGRESS_REQUEST_MAX_BYTES) {
@@ -564,6 +618,11 @@ async function parseJsonObject(req: Request): Promise<ParsedBody> {
   }
   if (!isRecord(parsed)) {
     return { ok: false, response: Response.json({ ok: false, error: "expected JSON object" }, { status: 400 }) };
+  }
+  // Checked after the top-level shape and before anything serializes: this is
+  // the last point where a refusal is still free of side effects.
+  if (exceedsJsonDepth(parsed, MAX_JSON_DEPTH)) {
+    return { ok: false, response: Response.json({ ok: false, error: "JSON nesting too deep" }, { status: 400 }) };
   }
   return { ok: true, body: parsed };
 }
@@ -598,7 +657,7 @@ function chatPage(): Response {
 }
 
 export function lastIngress(): IngressEvent | null {
-  return readJsonFile<IngressEvent | null>(LAST_INGRESS_FILE, null);
+  return readJsonFile<IngressEvent | null>(LAST_INGRESS_FILE, null, isIngressEvent);
 }
 
 // `/status` is unauthenticated, so it answers with a projection instead of the

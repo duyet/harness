@@ -516,11 +516,12 @@ export function listIssueDrafts(): IssueDraft[] {
   const files = readdirSync(ISSUES_DIR).filter((f) => f.endsWith(".json"));
   const out: IssueDraft[] = [];
   for (const f of files) {
-    try {
-      out.push(JSON.parse(readFileSync(join(ISSUES_DIR, f), "utf8")) as IssueDraft);
-    } catch {
-      /* skip */
-    }
+    // Through `readStoredDraft`, so the two readers of this directory cannot
+    // disagree about what a file may contain. A `.json` holding `null`, `[]`
+    // or `"x"` parses, and pushing it here would hand `cmdPick` and
+    // `cmdSummary` a value whose `.status` and `.fingerprint` they then read.
+    const parsed = readStoredDraft(join(ISSUES_DIR, f));
+    if (parsed) out.push(parsed as IssueDraft);
   }
   out.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
   return out;
