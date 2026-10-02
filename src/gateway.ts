@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import {
   VERSION,
@@ -39,7 +39,29 @@ export type IngressEvent = {
   freeform: boolean;
   route: unknown;
   body: unknown;
+  // Set only when the value beside them was capped. An ordinary event carries
+  // none of these, so its serialized shape is unchanged from before.
+  bodyTruncated?: boolean;
+  bodyBytes?: number;
+  textTruncated?: boolean;
+  textBytes?: number;
 };
+
+// --- ingress state bounds ----------------------------------------------------
+// The ingress routes are unauthenticated by design (the /chat execute gate above
+// covers only `execute`), so any caller can write to the state directory. Each
+// stored event is capped individually and the retained queue carries a byte
+// budget on top of its count window. Both thresholds sit far above ordinary
+// chat and error payloads: they exist to stop a loop of large POSTs, not to
+// trim real reports.
+const INGRESS_BODY_MAX_BYTES = 4 * 1024;
+const INGRESS_TEXT_MAX_CHARS = 200;
+const INGRESS_QUEUE_MAX_EVENTS = 50;
+const INGRESS_QUEUE_MAX_BYTES = 2 * 1024 * 1024;
+
+function byteLength(value: string): number {
+  return Buffer.byteLength(value, "utf8");
+}
 
 function readJsonFile<T>(path: string, fallback: T): T {
   if (!existsSync(path)) return fallback;
@@ -50,13 +72,68 @@ function readJsonFile<T>(path: string, fallback: T): T {
   }
 }
 
+// Both state files are rewritten on every request. Writing to a sibling temp
+// file and renaming means a crash mid-write can never leave half a JSON
+// document behind — same directory, so the rename stays within one filesystem.
+function writeJsonAtomic(path: string, value: unknown) {
+  const tmp = `${path}.${process.pid}.tmp`;
+  writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`);
+  renameSync(tmp, path);
+}
+
+// Above the cap the stored body becomes a prefix of the caller's serialized
+// payload. Trimming the parsed object instead would have to guess which keys
+// matter, and could yield a structure that still parses as real data.
+function capBody(raw: Record<string, unknown>): Pick<IngressEvent, "body" | "bodyTruncated" | "bodyBytes"> {
+  const serialized = JSON.stringify(raw);
+  const bytes = byteLength(serialized);
+  if (bytes <= INGRESS_BODY_MAX_BYTES) return { body: raw };
+  const prefix = Buffer.from(serialized, "utf8")
+    .subarray(0, INGRESS_BODY_MAX_BYTES)
+    // Slicing mid-character would leave a replacement char that reads like
+    // corruption rather than a deliberate cut.
+    .toString("utf8")
+    .replace(/�$/, "");
+  return { body: prefix, bodyTruncated: true, bodyBytes: bytes };
+}
+
+// `text` is what the chat page header and `harness summary` display, so it is
+// capped on its own: letting the body budget cut it would truncate it at an
+// arbitrary offset chosen by key order.
+function capText(text: string | null): Pick<IngressEvent, "text" | "textTruncated" | "textBytes"> {
+  if (text === null || text.length <= INGRESS_TEXT_MAX_CHARS) return { text };
+  return {
+    text: `${text.slice(0, INGRESS_TEXT_MAX_CHARS)}…`,
+    textTruncated: true,
+    textBytes: byteLength(text),
+  };
+}
+
+// Count window first, then the byte budget, so a burst of large events cannot
+// accumulate even while it is under 50 events. The newest event is always kept:
+// `last-ingress.json` and `/status` describe it, and dropping it would let the
+// budget silently swallow the event that was just accepted.
+function trimQueue(queue: IngressEvent[]): IngressEvent[] {
+  const recent = queue.slice(-INGRESS_QUEUE_MAX_EVENTS);
+  const kept: IngressEvent[] = [];
+  let bytes = 2; // the "[\n" / "\n]\n" wrapper of the pretty-printed array
+  for (let i = recent.length - 1; i >= 0; i--) {
+    const event = recent[i]!;
+    const size = byteLength(`${JSON.stringify(event, null, 2)}\n`) + 1; // + separating comma
+    if (kept.length > 0 && bytes + size > INGRESS_QUEUE_MAX_BYTES) break;
+    kept.push(event);
+    bytes += size;
+  }
+  return kept.reverse();
+}
+
 function persistIngress(event: IngressEvent) {
   mkdirSync(STATE_DIR, { recursive: true });
-  writeFileSync(LAST_INGRESS_FILE, `${JSON.stringify(event, null, 2)}\n`);
+  writeJsonAtomic(LAST_INGRESS_FILE, event);
   const queue = readJsonFile<IngressEvent[]>(INGRESS_QUEUE_FILE, []);
   queue.push(event);
-  const trimmed = queue.slice(-50);
-  writeFileSync(INGRESS_QUEUE_FILE, `${JSON.stringify(trimmed, null, 2)}\n`);
+  const trimmed = trimQueue(queue);
+  writeJsonAtomic(INGRESS_QUEUE_FILE, trimmed);
   return { last: event, queued: trimmed.length };
 }
 
@@ -129,12 +206,12 @@ export function handleIngress(source: "matrix" | "telegram" | "chat", raw: Recor
     at: new Date().toISOString(),
     source,
     taskId: norm.taskId,
-    text: norm.text,
+    ...capText(norm.text),
     sender: norm.sender,
     channel: norm.channel,
     freeform,
     route,
-    body: raw,
+    ...capBody(raw),
   };
   const saved = persistIngress(event);
   const adapterId =
@@ -359,6 +436,34 @@ export function lastIngress(): IngressEvent | null {
   return readJsonFile<IngressEvent | null>(LAST_INGRESS_FILE, null);
 }
 
+// `/status` is unauthenticated, so it answers with a projection instead of the
+// stored event: every field the chat page reads (`at`, `source`, `taskId`,
+// `text`), enough routing context to see what arrived, and the truncation flags
+// so a capped payload is visibly capped rather than quietly short. Operators who
+// need the whole event read it locally via `harness summary --json`, which is
+// served from disk and is not exposed on this route.
+function projectEvent(event: IngressEvent | null): Record<string, unknown> | null {
+  if (!event) return null;
+  const projection: Record<string, unknown> = {
+    at: event.at,
+    source: event.source,
+    taskId: event.taskId,
+    channel: event.channel,
+    sender: event.sender,
+    freeform: event.freeform,
+    text: event.text,
+  };
+  if (event.textTruncated) {
+    projection.textTruncated = true;
+    projection.textBytes = event.textBytes;
+  }
+  if (event.bodyTruncated) {
+    projection.bodyTruncated = true;
+    projection.bodyBytes = event.bodyBytes;
+  }
+  return projection;
+}
+
 export async function handleGatewayRequest(req: Request, bind: ReturnType<typeof gatewayBind>): Promise<Response> {
   const url = new URL(req.url);
   if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/chat")) {
@@ -397,7 +502,7 @@ export async function handleGatewayRequest(req: Request, bind: ReturnType<typeof
       listening: true,
       version: VERSION,
       bind,
-      lastEvent: lastIngress(),
+      lastEvent: projectEvent(lastIngress()),
       lastDelivery: lastDelivery(),
     });
   }

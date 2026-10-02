@@ -119,7 +119,22 @@ if (mode === "happy") {
     assert.equal(result.draft.title, `[${result.source}] fixture: example error`);
     assert.deepEqual(result.draft.labels, ["mock", result.source, "warning", "desk:sentry-issues"]);
   }
-  assert.deepEqual((await (await request("/status")).json()).lastEvent, readJson(LAST_INGRESS_FILE));
+  // /status answers with a projection, not the stored event: every field the
+  // chat page reads survives, and the body and route do not. The full event is
+  // still available locally through `harness summary --json`.
+  const stored = readJson(LAST_INGRESS_FILE);
+  const projected = (await (await request("/status")).json()).lastEvent;
+  assert.deepEqual(projected, {
+    at: stored.at,
+    source: stored.source,
+    taskId: stored.taskId,
+    channel: stored.channel,
+    sender: stored.sender,
+    freeform: stored.freeform,
+    text: stored.text,
+  });
+  assert.equal("body" in projected, false);
+  assert.equal("route" in projected, false);
 } else if (mode === "invalid" || mode === "invalid-seeded") {
   assert.equal(existsSync(STATE_DIR), false, "fixture must start without state");
   if (mode === "invalid-seeded") {

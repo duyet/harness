@@ -127,12 +127,14 @@ No network and no external service. Use `statSync`/`readFileSync` on the fixture
 
 ## Done criteria
 
-- [ ] Focused and full Bun suites exit 0.
-- [ ] Ingress persistence has a per-event byte cap and a total queue budget; the count window still applies.
-- [ ] Ordinary-sized events are stored exactly as before.
-- [ ] `GET /status` no longer returns raw bodies but still serves every field `src/static/chat.html` uses.
-- [ ] Truncation is visible to operators (flag plus original size), not silent.
-- [ ] `git diff --check` passes; file scope respected; index row updated.
+- [x] Focused and full Bun suites exit 0.
+- [x] Ingress persistence has a per-event byte cap and a total queue budget; the count window still applies.
+- [x] Ordinary-sized events are stored exactly as before.
+- [x] `GET /status` no longer returns raw bodies but still serves every field `src/static/chat.html` uses.
+- [x] Truncation is visible to operators (flag plus original size), not silent.
+- [x] `git diff --check` passes; file scope respected; index row updated.
+
+> **Implemented** with one forced file beyond the listed scope: `tests/fixtures/gateway-input-runner.ts:122` asserted `/status.lastEvent` deep-equalled the whole stored event, which is exactly the echo Step 3 removes. It now asserts the projection contract instead. No product code outside `src/gateway.ts` changed, and `src/shared.ts` needed no config addition (no env knob was used).
 
 ## STOP conditions
 
