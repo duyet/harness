@@ -227,17 +227,30 @@ After an in-place upgrade, **Press Ctrl+G in the agent to restart and resume.** 
 
 ## Verification
 
-Tests run on [Bun](https://bun.sh) with its built-in runner — no Herdr server or already-running gateway needed:
+Tests run on [Bun](https://bun.sh) with its built-in runner — no Herdr server or already-running gateway needed. **169 tests across 22 files**, all green:
 
 ```bash
+bun install
 bun run test
 ```
 
 - `tests/baseline.test.ts` covers session persistence, routing, issue normalization and pick rotation through `src/cli.ts`.
 - `tests/ctrl-g.test.ts` pins the Ctrl+G example snippet, the `harness.resume` plugin action id, and the `ctrlGHint` fields in `status --json`/`upgrade`.
 - `tests/gateway-pid.test.ts` covers the gateway lifecycle end to end — a real `start`/`status`/`stop` on an isolated port, plus the recycled-pid cases: `stop` must not signal a pid it could not verify, `--force` must, and a stale pid file must not wedge the next `start`.
+- `tests/manager-*.test.ts` cover spawn/exit/cleanup and Herdr timeouts; `tests/issues-*.test.ts` cover draft-path containment, `gh` timeouts, idempotent ingest and the stdin guard; `tests/pick-*.test.ts` and `tests/atomic-state-writes.test.ts` cover pick rotation across tiers and atomic state writes.
 - Each test runs the CLI in an isolated subprocess fixture under `dist/.test-tmp/` (own `HOME`, cwd and `TMPDIR`); nothing touches the real home or state directories.
-- There are no lint or typecheck gates in this repo, and `bun test` does not typecheck.
+
+### Typecheck
+
+`tsc` runs in strict mode over `src/` and `tests/` (`tsconfig.json`, `noEmit`):
+
+```bash
+bun run typecheck
+```
+
+> **Known-red baseline.** This does **not** currently pass. Plan 021 added it and hit its own STOP condition rather than weaken `strict` to force a green: the tree has **23 errors, 3 in `src/gateway.ts`**. `strict: false` is *worse* (25), and the canonical `@tsconfig/bun` config is far worse (189) — so the errors are real findings, not strictness noise. `bun test` does not typecheck and is unaffected. Full inventory and the fix order: [plans/022-clear-typecheck-baseline.md](plans/022-clear-typecheck-baseline.md).
+
+CI (`.github/workflows/test.yml`) runs `bun test` as a blocking gate and the typecheck non-blocking (`continue-on-error`) until that baseline is cleared.
 
 ## Not in this MVP
 

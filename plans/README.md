@@ -81,6 +81,8 @@ Fresh post-016 review (Herdr pane `harness-improve-run4` + `/improve` orientatio
 
 **021 last** (or whenever) — additive only; do not let a red typecheck force `src/` edits in the same PR (see its STOP conditions).
 
+> **021 executed** at `9c6121c`+ and hit that STOP exactly as written. `tsconfig.json`, the `typecheck` script and `.github/workflows/test.yml` landed; `src/` was not touched to force green. The typecheck job ships `continue-on-error: true` against a 23-error baseline (3 in `src/gateway.ts`). Clearing it is [022](022-clear-typecheck-baseline.md).
+
 ## Recommended execution order
 
 ```
@@ -148,7 +150,8 @@ Prefer **007** and **008** first (integrity + security). 009–011 may follow in
 | 018 | Make `executeCleanup` idempotent (failed tab-close must not wedge spawns) | DONE | 006, 013 |
 | 019 | Write all harness state files atomically (temp + rename) | DONE | none |
 | 020 | Refuse interactive stdin for `harness issues ingest` | DONE | none |
-| 021 | Add a `typecheck` script and a one-file CI workflow | OPEN | 001 |
+| 021 | Add a `typecheck` script and a one-file CI workflow | BLOCKED — STOP: tip has 23 type errors (3 in `src/gateway.ts`); `tsconfig.json` + script landed, CI typecheck job ships non-blocking | 001 |
+| 022 | Clear the 23-error typecheck baseline, then enforce the gate | OPEN | 021 |
 
 Status values: OPEN | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJECTED (with one-line rationale).
 
@@ -158,7 +161,7 @@ Status values: OPEN | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJE
 
 - Large product scope (Matrix real tokens, new crons, GitHub create, release-please changes): explicitly out of scope for this burn-test.
 - Expanding gateway into multi-tenant / auth: direction-only; not planned. **Re-confirmed in Runs 3–4:** plan 008 landed the execute gate; Run 4 did not re-raise general auth. Origin on *ingress* remains the same deferred decision.
-- Full lint/eslint beyond typecheck: still deferred. **Run 4 note:** plan 021 covers the typecheck + one-file CI slice that Runs 1–3 parked; broader lint stays out.
+- Full lint/eslint beyond typecheck: still deferred. **Run 4 note:** plan 021 covers the typecheck + one-file CI slice that Runs 1–3 parked; broader lint stays out. **Post-021:** `tsc` runs but is not yet green, and no lint stack exists at all.
 - Splitting `src/cli.ts` (~1460 lines vs a ~238-line repo median): rejected for now. Still no god-object symptoms — the cost remains untested surface, not size. **Run 4:** line count grew with 012–016; still not planned.
 
 ### Run 3 items promoted in Run 4
@@ -167,7 +170,11 @@ Status values: OPEN | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJE
 - `executeCleanup` is not idempotent → **[018](018-idempotent-execute-cleanup.md)**
 - State files written non-atomically → **[019](019-atomic-state-file-writes.md)**
 - `harness issues ingest` stdin hang → **[020](020-bound-issues-ingest-stdin.md)**
-- typecheck + CI scaffolding → **[021](021-typecheck-and-minimal-ci.md)**
+- typecheck + CI scaffolding → **[021](021-typecheck-and-minimal-ci.md)** (landed partial — see below)
+
+### Filed by 021's STOP condition
+
+- Typecheck baseline: 23 errors, 3 in `src/gateway.ts`; weakening `strict` makes it worse, not better → **[022](022-clear-typecheck-baseline.md)**
 
 ### Run 3/4 vetted, still deferred (ranked below the five)
 
@@ -175,7 +182,7 @@ Status values: OPEN | IN PROGRESS | DONE | BLOCKED (with one-line reason) | REJE
 - **Chat adapter timeouts kill only the direct child** — `src/chat.ts` SIGKILLs `child` without `detached`/process-group kill, so grandchildren from real agent CLIs can survive. MED confidence.
 - **`harness summary | jq` emits markdown** — `cmdStatus`/`cmdPick` use `--json || !process.stdout.isTTY`; `cmdSummary` (`src/cli.ts:1360`) checks only `--json`. S effort, dx-only; ranked below 020.
 - **`waitHealth` treats any 2xx from the port as success** with no body identity check — partly subsumed by plan 012's PID identity; a squatter on 8787 can still make `gateway start` report `listening: true` briefly. Leave until 012's tests want a follow-up.
-- **README/schema drift** — `README.md` still runs `harness upgrade` before extending `PATH`; `herdr-harness.schema.json` omits `adapters.chat.executeKinds` under `additionalProperties: false`; `HERDR_BIN_PATH`/`HERDR_SOCKET` undocumented; Verification section under-names test files. All S-effort docs; fold into 021's README touch or a docs-only follow-up.
+- **README/schema drift** — `README.md` still runs `harness upgrade` before extending `PATH`; `herdr-harness.schema.json` omits `adapters.chat.executeKinds` under `additionalProperties: false`; `HERDR_BIN_PATH`/`HERDR_SOCKET` undocumented. All S-effort docs; fold into a docs-only follow-up. **Partly done in 021:** the Verification section now names the current 22 test files / 169 tests and documents the typecheck baseline.
 
 ### Direction options (grounded, not defects — for the maintainer to weigh)
 

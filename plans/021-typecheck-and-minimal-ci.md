@@ -15,6 +15,8 @@
 - **Confidence:** HIGH (deferred explicitly from Runs 1–3 as "candidates for Run 4" once 001 proved value)
 - **Planned at:** commit `5fd3cf0`, 2026-10-02 (Run 4)
 
+> **Executed — partial, via STOP.** `tsconfig.json`, `package.json#scripts.typecheck` (+ `typescript`/`@types/bun` devDeps) and `.github/workflows/test.yml` landed. The typecheck is **not green**: 23 errors, 3 in `src/gateway.ts`. The STOP condition held — no `src/` was edited to force green, and no knob was loosened to fake it (measured: `strict: false` is worse at 25; canonical `@tsconfig/bun` is 189). The CI typecheck job ships `continue-on-error: true`; the `test` job is a real blocking gate. Done-criteria boxes stay unticked. Follow-up: [022](022-clear-typecheck-baseline.md).
+
 ## Why this matters
 
 Plan 001 established a hermetic Bun test baseline. Runs 2–4 have stacked ~20 plan-driven refactors on top with **no** `tsc` / CI gate. A one-line `typecheck` script and a single GitHub Actions workflow that runs `bun test` (+ typecheck) on push/PR would have caught several of the class of mistakes these plans fix (signature drift, unused exports, missing fields) before review. Run 3's README already named this as a Run 4 candidate after 001 proved value (then 104 tests; now 148).
