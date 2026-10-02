@@ -12,7 +12,7 @@ import {
   gatewayBind,
   lastDelivery,
 } from "./shared.ts";
-import { ingestErrorEvent } from "./issues.ts";
+import { ingestErrorEvent, type IssueDraft } from "./issues.ts";
 import {
   CHAT_ALLOW_ORIGIN_ENV,
   CHAT_ALLOW_REMOTE_ENV,
@@ -618,6 +618,33 @@ function projectEvent(event: IngressEvent | null): Record<string, unknown> | nul
   return projection;
 }
 
+// `/ingress/sentry` and `/ingress/bugsink` are unauthenticated, so their 202
+// answers a projection the way `/status` does — never the draft. Returning the
+// whole draft re-served the entire stored payload, which for a large event is
+// megabytes echoed straight back to the POSTer. What survives is what a caller
+// needs to correlate the ingest and then go read the file.
+function projectIssueDraft(draft: IssueDraft): Record<string, unknown> {
+  const projection: Record<string, unknown> = {
+    id: draft.id,
+    fingerprint: draft.fingerprint,
+    title: draft.title,
+    source: draft.source,
+    playbook: draft.playbook,
+    labels: draft.labels,
+    status: draft.status,
+    path: draft.path,
+    createdAt: draft.createdAt,
+  };
+  if (draft.githubIssueUrl) projection.githubIssueUrl = draft.githubIssueUrl;
+  if (draft.githubIssueNumber != null) projection.githubIssueNumber = draft.githubIssueNumber;
+  if (draft.bodyTruncated) {
+    projection.bodyTruncated = true;
+    projection.bodyBytes = draft.bodyBytes;
+  }
+  if (draft.evicted?.length) projection.evicted = draft.evicted;
+  return projection;
+}
+
 export async function handleGatewayRequest(req: Request, bind: ReturnType<typeof gatewayBind>): Promise<Response> {
   const url = new URL(req.url);
   if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/chat")) {
@@ -678,13 +705,13 @@ export async function handleGatewayRequest(req: Request, bind: ReturnType<typeof
     const parsed = await parseJsonObject(req);
     if (!parsed.ok) return parsed.response;
     const draft = ingestErrorEvent("sentry", parsed.body);
-    return Response.json({ ok: true, source: "sentry", queued: true, draft }, { status: 202 });
+    return Response.json({ ok: true, source: "sentry", queued: true, draft: projectIssueDraft(draft) }, { status: 202 });
   }
   if (req.method === "POST" && url.pathname === "/ingress/bugsink") {
     const parsed = await parseJsonObject(req);
     if (!parsed.ok) return parsed.response;
     const draft = ingestErrorEvent("bugsink", parsed.body);
-    return Response.json({ ok: true, source: "bugsink", queued: true, draft }, { status: 202 });
+    return Response.json({ ok: true, source: "bugsink", queued: true, draft: projectIssueDraft(draft) }, { status: 202 });
   }
   return Response.json({ ok: false, error: "not found" }, { status: 404 });
 }

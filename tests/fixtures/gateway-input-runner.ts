@@ -48,8 +48,14 @@ async function accepted(path: string, body: Record<string, unknown>) {
     assert.equal(result.draft.status, "mock-draft");
     assert.equal(result.draft.playbook, "desk:sentry-issues");
     assert.equal(dirname(result.draft.path), ISSUES_DIR);
-    assert.deepEqual(result.draft.raw, body);
-    assert.deepEqual(readJson(result.draft.path), result.draft);
+    // The 202 answers with a projection, not the draft, so the payload is
+    // checked where it actually lives — on disk — rather than in the echo.
+    const stored = readJson(result.draft.path);
+    assert.equal(stored.fingerprint, result.draft.fingerprint);
+    assert.equal(stored.path, result.draft.path);
+    assert.deepEqual(stored.raw, body);
+    assert.equal("raw" in result.draft, false);
+    assert.equal("body" in result.draft, false);
   } else {
     queued++;
     assert.equal(result.queued, queued);

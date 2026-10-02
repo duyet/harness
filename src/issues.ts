@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { ISSUES_DIR, PLAYBOOK_SENTRY } from "./shared.ts";
 
@@ -18,6 +18,14 @@ export type IssueDraft = {
   githubIssueNumber?: number;
   path?: string;
   raw?: unknown;
+  // Set only when the stored payload was cut at ISSUE_PAYLOAD_MAX_BYTES. An
+  // ordinary draft carries neither, so its serialized shape is unchanged; a
+  // draft written before the cap existed simply lacks them.
+  bodyTruncated?: boolean;
+  bodyBytes?: number;
+  // Reported on the copy `writeIssueDraft` returns, never written to the file:
+  // which drafts the directory bound evicted during this write.
+  evicted?: string[];
 };
 
 function str(v: unknown): string | null {
@@ -37,18 +45,51 @@ export function fingerprintFor(raw: Record<string, unknown>): string {
 const SOURCE_NOTE_MOCK = "mock — GitHub API not called";
 const SOURCE_NOTE_GH = "created via gh issue create";
 
+// A UTF-8 prefix of `value`, cut at a byte boundary so the cut never lands
+// mid-character. Same trade plan 010's `capBody` makes: cutting the parsed
+// object instead would have to guess which keys matter and could leave a
+// structure that still reads as real data.
+function bytePrefix(value: string, maxBytes: number): string {
+  return Buffer.from(value, "utf8")
+    .subarray(0, maxBytes)
+    .toString("utf8")
+    .replace(/�$/, "");
+}
+
+function capHeader(value: string): string {
+  return value.length > ISSUE_HEADER_MAX_CHARS ? `${value.slice(0, ISSUE_HEADER_MAX_CHARS)}…` : value;
+}
+
 function buildDraft(
   source: "sentry" | "bugsink",
   raw: Record<string, unknown>,
   sourceNote: string,
 ): IssueDraft {
   const message = str(raw.message) || str(raw.title) || "unknown error";
-  const culprit = str(raw.culprit) || str(raw.transaction) || str(raw.logger) || "";
-  const project = str(raw.project) || str(raw.project_name) || "unknown";
-  const level = str(raw.level) || "error";
+  // The header lines are drawn from the same caller-controlled payload as the
+  // JSON block, so they need a bound of their own — otherwise a 20 MB
+  // `culprit` would make the payload cap below unreachable. Real values are
+  // tens of characters. `project` and `level` are capped once and reused for
+  // the title and the labels, so nothing uncapped escapes into those either.
+  const culprit = capHeader(str(raw.culprit) || str(raw.transaction) || str(raw.logger) || "");
+  const project = capHeader(str(raw.project) || str(raw.project_name) || "unknown");
+  const level = capHeader(str(raw.level) || "error");
+  // Fingerprint the *full* payload, before anything below is cut: two large
+  // events that share a prefix must not collapse onto one fingerprint and lose
+  // a real report.
   const fingerprint = fingerprintFor(raw);
   const createdAt = new Date().toISOString();
   const title = `[${source}] ${project}: ${message}`.slice(0, 120);
+
+  const serialized = JSON.stringify(raw);
+  const payloadBytes = Buffer.byteLength(serialized, "utf8");
+  const truncated = payloadBytes > ISSUE_PAYLOAD_MAX_BYTES;
+  // Below the cap nothing changes at all — same pretty-printed block, same
+  // stored object. Above it the block holds a prefix of the serialized event,
+  // embedded verbatim rather than re-stringified: re-encoding the prefix would
+  // escape it and could inflate it back past the cap.
+  const payload = truncated ? bytePrefix(serialized, ISSUE_PAYLOAD_MAX_BYTES) : JSON.stringify(raw, null, 2);
+
   const body = [
     `Playbook: ${PLAYBOOK_SENTRY}`,
     `Source: ${source} (${sourceNote})`,
@@ -58,7 +99,7 @@ function buildDraft(
     `Fingerprint: ${fingerprint}`,
     "",
     "```json",
-    JSON.stringify(raw, null, 2),
+    payload,
     "```",
   ]
     .filter(Boolean)
@@ -74,7 +115,8 @@ function buildDraft(
     fingerprint,
     createdAt,
     status: "mock-draft",
-    raw,
+    raw: truncated ? payload : raw,
+    ...(truncated ? { bodyTruncated: true, bodyBytes: payloadBytes } : {}),
   };
 }
 
@@ -128,6 +170,63 @@ function mergePublishedState(draft: IssueDraft, stored: IssueDraft): IssueDraft 
   };
 }
 
+// Eviction is not free here: a draft is the record of what was filed, and a
+// `github-created` one is specifically what stops an upstream replay filing a
+// duplicate issue. Those are never evicted — only `mock-draft` entries go, and
+// oldest-first. `keepPath` is the draft just written, mirroring `trimQueue`'s
+// "newest always survives": a single draft that is itself over the byte budget
+// must leave the directory holding that draft rather than emptying it.
+//
+// Ordering is by mtime, which for this purpose tracks `createdAt`: a
+// `mock-draft` is never rewritten (the rewrite path in `mergePublishedState`
+// only fires for an already-published one), so its file mtime is its write
+// time. Using it means the sweep reads a draft only when it is about to evict
+// it — reading every file on every ingest would make this bound quadratic in
+// exactly the directory it exists to bound.
+//
+// Filesystem timestamp granularity is coarse (a burst of writes can share one
+// mtime down to the nanosecond, so ns precision buys nothing), so drafts the
+// filesystem cannot tell apart are ordered by name. That is a determinism
+// tie-break, not an age claim: among drafts of indistinguishable age any order
+// is correct, and a fixed one keeps "what did the bound evict" reproducible
+// instead of varying with directory read order.
+function trimIssueDrafts(keepPath: string): string[] {
+  if (!existsSync(ISSUES_DIR)) return [];
+  const entries = [];
+  for (const name of readdirSync(ISSUES_DIR)) {
+    if (!name.endsWith(".json")) continue;
+    const path = join(ISSUES_DIR, name);
+    let stats;
+    try {
+      stats = statSync(path);
+    } catch {
+      continue;
+    }
+    if (!stats.isFile()) continue;
+    entries.push({ path, name, size: stats.size, mtimeMs: stats.mtimeMs });
+  }
+  let count = entries.length;
+  let bytes = entries.reduce((total, e) => total + e.size, 0);
+  const evicted: string[] = [];
+  const oldestFirst = [...entries].sort(
+    (a, b) => a.mtimeMs - b.mtimeMs || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0),
+  );
+  for (const entry of oldestFirst) {
+    if (count <= ISSUES_DIR_MAX_DRAFTS && bytes <= ISSUES_DIR_MAX_BYTES) break;
+    if (entry.path === keepPath) continue;
+    if (readStoredDraft(entry.path)?.status !== "mock-draft") continue;
+    try {
+      unlinkSync(entry.path);
+    } catch {
+      continue;
+    }
+    count -= 1;
+    bytes -= entry.size;
+    evicted.push(entry.name);
+  }
+  return evicted;
+}
+
 export function writeIssueDraft(draft: IssueDraft): IssueDraft {
   if (draft.source !== "sentry" && draft.source !== "bugsink") {
     throw new Error(`invalid issue source: ${String(draft.source)}`);
@@ -144,7 +243,12 @@ export function writeIssueDraft(draft: IssueDraft): IssueDraft {
       : draft;
   const stored = { ...effective, path };
   writeFileSync(path, `${JSON.stringify(stored, null, 2)}\n`);
-  return stored;
+  // Trimmed after the write, so the new draft is counted and is the one kept.
+  // The eviction list rides on the returned copy only — the file on disk never
+  // carries it, so `listIssueDrafts` cannot read one draft's eviction as
+  // another draft's record.
+  const evicted = trimIssueDrafts(path);
+  return evicted.length ? { ...stored, evicted } : stored;
 }
 
 export function ingestErrorEvent(source: "sentry" | "bugsink", raw: Record<string, unknown>): IssueDraft {
@@ -187,6 +291,36 @@ export const GH_TIMEOUT_ENV = "HARNESS_GH_TIMEOUT_MS";
 export const DEFAULT_GH_TIMEOUT_MS = 60_000;
 export const MIN_GH_TIMEOUT_MS = 1_000;
 export const MAX_GH_TIMEOUT_MS = 5 * 60_000;
+
+// --- draft bounds ------------------------------------------------------------
+// `/ingress/sentry` and `/ingress/bugsink` are unauthenticated and bypass the
+// gateway's ingress caps entirely, so the draft is the only bound on what one
+// POST can write. Two things were unbounded: the payload — embedded in `body`
+// and stored again in `raw`, the same bytes twice, so a 2 MB event became a
+// 4.2 MB file — and how many drafts the directory could hold.
+//
+// The payload cap has to clear two ceilings at once. It must sit well above a
+// real alert: a Sentry or Bugsink event is a few KB, and a busy stack trace
+// with a long breadcrumb list runs to tens of KB. And it must sit *below* the
+// OS limit on a single argument, because `gh issue create` takes the whole body
+// as one argv element and Linux caps that at MAX_ARG_STRLEN (32 pages = 128
+// KiB); measured here, posix_spawn returns E2BIG at about 131 KB. 96 KiB plus
+// the draft's ~200 bytes of header leaves roughly 32 KB of margin, so a draft
+// inside the cap is always publishable. Anything larger is cut rather than
+// dropped, and the cut is visible on the draft.
+const ISSUE_PAYLOAD_MAX_BYTES = 96 * 1024;
+// Real `Project`/`Level`/`Culprit` values are tens of characters; the title is
+// already sliced to 120. Without this a caller could make the header alone
+// megabytes and the payload cap would never be reached.
+const ISSUE_HEADER_MAX_CHARS = 500;
+
+// `listIssueDrafts` reads the whole directory on every `issues list`, `pick` and
+// `summary`, so growth here is paid on every operator command rather than only
+// at ingest. Same shape as the gateway's ingress queue: a count window and a
+// byte budget on top. At the payload cap the byte budget binds first (~170
+// drafts); with ordinary multi-KB alerts the count window binds at 200.
+const ISSUES_DIR_MAX_DRAFTS = 200;
+const ISSUES_DIR_MAX_BYTES = 16 * 1024 * 1024;
 
 export function ghTimeoutMs(): number {
   const n = Number(process.env[GH_TIMEOUT_ENV]);
@@ -236,6 +370,7 @@ export function publishIssueDraft(draft: IssueDraft, ghBin = "gh"): GhCreateOutc
   }
   const args = ghIssueCreateArgv(draft);
   const command = [ghBin, ...args];
+  const bodyBytes = Buffer.byteLength(args[args.indexOf("--body") + 1] ?? "", "utf8");
   const timeoutMs = ghTimeoutMs();
   const r = spawnSync(ghBin, args, {
     encoding: "utf8",
@@ -261,6 +396,25 @@ export function publishIssueDraft(draft: IssueDraft, ghBin = "gh"): GhCreateOutc
       stderr,
       error:
         `gh issue create timed out after ${timeoutMs}ms; it may or may not have been filed, so re-running is safe`,
+      draft,
+    };
+  }
+  // An argument-list failure is not an unusable `gh`: the binary is present and
+  // working, and the real cause is the size of the body the draft handed it.
+  // Reporting it as "gh not usable" sends the operator to debug their CLI for a
+  // problem their CLI does not have.
+  if ((r.error as NodeJS.ErrnoException | undefined)?.code === "E2BIG") {
+    return {
+      ok: false,
+      command,
+      status: r.status,
+      stdout,
+      stderr,
+      error:
+        `gh issue create argument list too long (E2BIG): the issue body is ${bodyBytes} bytes, ` +
+        `past the OS limit on a single argument (~128 KiB on Linux). Draft payloads are capped at ` +
+        `${ISSUE_PAYLOAD_MAX_BYTES} bytes, so this is a draft stored before that cap — re-ingest the ` +
+        `event to rebuild it, or shorten the body.`,
       draft,
     };
   }
