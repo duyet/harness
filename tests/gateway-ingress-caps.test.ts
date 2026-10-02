@@ -90,6 +90,26 @@ describe("ingress field caps (isolated; the socket case binds loopback only)", (
     }
   });
 
+  test("the POST responses project the task: bounded, flagged, and byte-identical when small", () => {
+    // The return path, which the stored-event caps never reached.
+    const detail = run("response");
+    expect(detail.marker).toBe("harness-ingress-cap-marker-4c1d9e");
+    const observed = detail.responseBytes as Array<{
+      path: string;
+      smallBytes: number;
+      hugeBytes: number;
+    }>;
+    expect(observed.map((o) => o.path)).toEqual([
+      "/ingress/matrix",
+      "/ingress/telegram",
+      "/chat",
+    ]);
+    for (const entry of observed) {
+      expect(entry.hugeBytes, entry.path).toBeLessThan(4 * 1024);
+      expect(entry.smallBytes, entry.path).toBeLessThan(4 * 1024);
+    }
+  });
+
   test("a declared oversized body is a 413 that writes nothing", () => {
     const detail = run("content-length");
     expect(detail.declared).toBe("262145");

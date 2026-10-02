@@ -61,6 +61,17 @@ async function post(path: string, body: Record<string, unknown>) {
   return result as Record<string, any>;
 }
 
+// The same POST, kept as bytes: a response bound is a statement about size, and
+// a parsed object cannot show it.
+async function postRaw(path: string, body: Record<string, unknown>) {
+  const response = await request(path, "POST", JSON.stringify(body));
+  assert.equal(response.status, path === "/chat" ? 200 : 202, path);
+  const raw = await response.text();
+  const json = JSON.parse(raw) as Record<string, any>;
+  assert.equal(json.ok, true, path);
+  return { json, raw, bytes: Buffer.byteLength(raw, "utf8") };
+}
+
 async function getStatus() {
   const response = await request("/status");
   assert.equal(response.status, 200);
@@ -251,9 +262,11 @@ if (mode === "verbatim") {
       assert.equal(event.sender, "chat-ui", path);
       assert.equal("senderTruncated" in event, false, path);
     }
-    // The response echoes the caller's own uncapped text, but the sender the
-    // normalizer produced — the cap runs there, not at the response.
-    assert.equal(result.task.text, text, path);
+    // The response carries the *projected* task: the caller's text is capped
+    // and says so, and the sender is the one the normalizer produced.
+    assert.equal(result.task.text, event.text, path);
+    assert.equal(result.task.textTruncated, true, path);
+    assert.equal(result.task.textBytes, event.textBytes, path);
     assert.equal(result.task.sender, event.sender, path);
     assert.equal(result.task.sender.includes(MARKER), false, path);
 
@@ -279,6 +292,101 @@ if (mode === "verbatim") {
     assert(entry.statusBytes < 4 * 1024, `${entry.path}: /status was ${entry.statusBytes} bytes`);
   }
   detail = { marker: MARKER, statusBytes: observed };
+} else if (mode === "response") {
+  // Case 9: the *return* path, which no cap above touched. The stored copy was
+  // bounded all along while the raw value left the process uncapped — once in
+  // the 202, and twice on /chat, which carries the text in `task` and again
+  // inside the interpolated `reply`. Two questions kept apart: is an ordinary
+  // answer still byte-identical, and does a large one stay bounded however large
+  // the request was.
+  const bodyFor = (path: string, text: string): Record<string, unknown> =>
+    path === "/ingress/matrix"
+      ? { content: { body: text } }
+      : path === "/ingress/telegram"
+        ? { message: { text, chat: { id: 5 }, from: { username: "alice" } } }
+        : { text };
+  const envelopeFor = (path: string) =>
+    path === "/chat"
+      ? ["adapterId", "lastEvent", "mode", "ok", "queued", "reply", "route", "task"]
+      : ["lastEvent", "ok", "queued", "route", "source", "task"];
+
+  // Ordinary message: the same keys and the same values as before this cap, and
+  // no flag anywhere — a caller reading `task.id` / `task.adapterId` to
+  // correlate an ingest is unaffected, because none of that was dropped.
+  for (const path of SOURCES) {
+    const result = await post(path, bodyFor(path, "hello there"));
+    assert.deepEqual(Object.keys(result).sort(), envelopeFor(path), path);
+    assert.deepEqual(Object.keys(result.task).sort(), [
+      "adapterId", "channel", "freeform", "id", "sender", "text",
+    ], path);
+    assert.equal(result.task.text, "hello there", path);
+    assert.equal(result.task.id, null, path);
+    assert.equal(result.task.freeform, true, path);
+    assert.equal(result.task.adapterId, "fixture-adapter", path);
+    assert.equal("textTruncated" in result.task, false, path);
+    assert.equal("textBytes" in result.task, false, path);
+    if (path === "/chat") {
+      // The other half of the doubling: an uncapped reply here would put the
+      // payload back after the task was already capped.
+      assert.equal(result.reply, "stub: freeform via fixture-adapter — hello there", path);
+    }
+  }
+
+  // 200 KB of caller text, against a 700-byte request of the same kind. The
+  // requests differ by ~300x; the answers may not.
+  const small = "s".repeat(TEXT_MAX_CHARS + 500);
+  const huge = big("t", 200 * 1024);
+  assert(Buffer.byteLength(JSON.stringify(bodyFor("/chat", huge)), "utf8") < REQUEST_MAX_BYTES);
+  const observed: Array<{ path: string; smallBytes: number; hugeBytes: number }> = [];
+  for (const path of SOURCES) {
+    const shortAnswer = await postRaw(path, bodyFor(path, small));
+    const longAnswer = await postRaw(path, bodyFor(path, huge));
+    for (const [label, answer, sent] of [["small", shortAnswer, small], ["huge", longAnswer, huge]] as const) {
+      assert.equal(answer.json.task.text, `${sent.slice(0, TEXT_MAX_CHARS)}…`, `${path} ${label}`);
+      assert.equal(answer.json.task.textTruncated, true, `${path} ${label}`);
+      assert.equal(answer.json.task.textBytes, Buffer.byteLength(sent, "utf8"), `${path} ${label}`);
+      assert(
+        answer.bytes < 4 * 1024,
+        `${path} ${label}: ${answer.bytes} bytes back for a ${Buffer.byteLength(sent, "utf8")}-byte text`,
+      );
+    }
+    // The markers are the unambiguous check: in the request, out of the answer.
+    assert.equal(longAnswer.raw.includes(MARKER), false, `${path}: echoed the payload`);
+    assert.equal(longAnswer.raw.includes(TAIL), false, `${path}: echoed the payload`);
+    // The same flags, on both halves of the /chat response.
+    if (path === "/chat") {
+      assert.equal(longAnswer.json.reply.includes(MARKER), false, "/chat: reply echoed the payload");
+      assert.equal(
+        longAnswer.json.reply,
+        `stub: freeform via fixture-adapter — ${huge.slice(0, TEXT_MAX_CHARS)}…`,
+      );
+    }
+    // What was stored is the stored event this plan did not touch: same
+    // truncation contract, same real byte count, same cap the projection used.
+    const event = readJson(LAST_INGRESS_FILE);
+    assert.equal(event.text, longAnswer.json.task.text, path);
+    assert.equal(event.textTruncated, true, path);
+    assert.equal(event.textBytes, longAnswer.json.task.textBytes, path);
+    observed.push({ path, smallBytes: shortAnswer.bytes, hugeBytes: longAnswer.bytes });
+  }
+  // Bounded is not "smaller than some absolute number": the two answers for one
+  // route must agree to within the text cap itself, whatever went in.
+  for (const entry of observed) {
+    assert(
+      Math.abs(entry.hugeBytes - entry.smallBytes) <= 4 * TEXT_MAX_CHARS,
+      `${entry.path}: ${entry.smallBytes} vs ${entry.hugeBytes} bytes for 300x the input`,
+    );
+  }
+
+  // The only in-repo consumer of /chat is the page, and it reads `reply`. If it
+  // ever starts reading the dropped payload, this is the line that says so.
+  // Resolved from this file, not from `cwd`: the fixture cwd is an empty
+  // directory and the runner reaches the real sources the same way.
+  const chatHtml = readFileSync(new URL("../../src/static/chat.html", import.meta.url), "utf8");
+  assert.match(chatHtml, /j\.reply/, "chat page still reads the reply");
+  assert.equal(/\bj\.task\b/.test(chatHtml), false, "chat page started reading the projected task");
+
+  detail = { marker: MARKER, responseBytes: observed };
 } else if (mode === "content-length") {
   // Case 7: a declared oversized body is refused with 413 before it is read,
   // leaving the queue exactly as it was.

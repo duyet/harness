@@ -198,6 +198,24 @@ function capText(text: string | null): Pick<IngressEvent, "text" | "textTruncate
   return { text: capped.value, textTruncated: true, textBytes: capped.bytes };
 }
 
+// The bounds above apply to what is *persisted*; nothing bounded what was
+// *returned*, so the same value left the process uncapped in the 202 and — on
+// `/chat`, which carries the text twice — again inside the stub `reply`. The
+// response is the caller's own bytes, so this is not a disclosure; it is that an
+// endpoint documented as bounding ingress must not hand back more than it
+// stores. The fields a caller correlates an ingest with (id, adapter, route
+// decision, sender, channel) all survive, and the cap is `capText` rather than a
+// new one so a shortened response says so with `textTruncated` / `textBytes`
+// instead of reading as a short message.
+function projectTask(task: ReturnType<typeof handleIngress>["task"]) {
+  // The cap is spread *over* the task rather than beside it, so `text` keeps the
+  // position it already held: an ordinary answer then serializes to exactly the
+  // bytes it did before this projection existed, and the truncation flags —
+  // which `capText` omits entirely when nothing was cut — are the only keys a
+  // capped answer adds.
+  return { ...task, ...capText(task.text) };
+}
+
 // Count window first, then the byte budget, so a burst of large events cannot
 // accumulate even while it is under 50 events. The newest event is always kept:
 // `last-ingress.json` and `/status` describe it, and dropping it would let the
@@ -373,7 +391,10 @@ export function handleIngress(source: "matrix" | "telegram" | "chat", raw: Recor
 }
 
 function stubReply(result: ReturnType<typeof handleIngress>): string {
-  const t = result.task;
+  // Through the projection, because the freeform branch below interpolates the
+  // caller's own text: capping the task alone would still leave the payload a
+  // second time in the same response.
+  const t = projectTask(result.task);
   if (t.freeform) {
     return `stub: freeform via ${t.adapterId} — ${t.text ?? "(empty)"}`;
   }
@@ -761,7 +782,7 @@ export async function handleGatewayRequest(req: Request, bind: ReturnType<typeof
     const body: Record<string, unknown> = {
       ok: true,
       ...reply,
-      task: result.task,
+      task: projectTask(result.task),
       route: result.route,
       lastEvent: result.lastEvent,
       queued: result.queued,
@@ -792,14 +813,14 @@ export async function handleGatewayRequest(req: Request, bind: ReturnType<typeof
     if (!parsed.ok) return parsed.response;
     if (!matrixShape(parsed.body)) return badPayload();
     const result = handleIngress("matrix", parsed.body);
-    return Response.json(result, { status: 202 });
+    return Response.json({ ...result, task: projectTask(result.task) }, { status: 202 });
   }
   if (req.method === "POST" && url.pathname === "/ingress/telegram") {
     const parsed = await parseJsonObject(req);
     if (!parsed.ok) return parsed.response;
     if (!telegramShape(parsed.body)) return badPayload();
     const result = handleIngress("telegram", parsed.body);
-    return Response.json(result, { status: 202 });
+    return Response.json({ ...result, task: projectTask(result.task) }, { status: 202 });
   }
   if (req.method === "POST" && url.pathname === "/ingress/sentry") {
     const parsed = await parseJsonObject(req);

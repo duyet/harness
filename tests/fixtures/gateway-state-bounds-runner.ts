@@ -149,8 +149,11 @@ if (mode === "verbatim") {
   assert.equal(event.text, `${"y".repeat(TEXT_MAX_CHARS)}…`);
   assert.equal(event.text.length, TEXT_MAX_CHARS + 1);
 
-  // The POST response still echoes the caller's own uncapped text.
-  assert.equal(result.task.text, raw.message.text);
+  // The POST response carries the projected task: same cap, same real size, and
+  // it says so — the two halves of the contract now agree.
+  assert.equal(result.task.text, event.text);
+  assert.equal(result.task.textTruncated, true);
+  assert.equal(result.task.textBytes, event.textBytes);
 
   // Case 4: /status projects, and the payload never reaches it.
   const status = await getStatus();
